@@ -13,6 +13,8 @@ import json
 import subprocess
 import re
 import threading
+import ctypes
+from ctypes import c_uint32, c_uint64, c_void_p, c_int
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QPushButton,
@@ -22,9 +24,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QSize, QMetaObject, Q_ARG, pyqtSignal, QObject,
-    QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup
+    QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup,
+    QMimeData
 )
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase, QDrag
 from AppKit import NSWorkspace, NSImage, NSBitmapImageRep, NSPNGFileType, NSRunningApplication
 from Foundation import NSURL, NSData
 import objc
@@ -42,6 +45,131 @@ CONFIG_PATH = Path.home() / "Клэр" / "apps" / "space-manager" / "config.json
 # Кэш иконок приложений
 _app_icon_cache = {}
 _running_apps_cache = {}  # Кэш запущенных приложений
+
+# SkyLight API для работы со Spaces
+_skylight = None
+_sls_connection = None
+_space_ids_cache = {}
+
+
+def _init_skylight():
+    """Инициализировать SkyLight framework"""
+    global _skylight, _sls_connection
+    if _skylight is not None:
+        return True
+    try:
+        _skylight = ctypes.CDLL('/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight')
+
+        # SLSMainConnectionID
+        SLSMainConnectionID = _skylight.SLSMainConnectionID
+        SLSMainConnectionID.restype = c_uint32
+        _sls_connection = SLSMainConnectionID()
+
+        return _sls_connection > 0
+    except Exception as e:
+        print(f"SkyLight init error: {e}")
+        return False
+
+
+def get_space_ids_map():
+    """Получить карту: номер Space -> ManagedSpaceID"""
+    global _space_ids_cache
+    if _space_ids_cache:
+        return _space_ids_cache
+
+    if not _init_skylight():
+        return {}
+
+    try:
+        SLSCopyManagedDisplaySpaces = _skylight.SLSCopyManagedDisplaySpaces
+        SLSCopyManagedDisplaySpaces.argtypes = [c_uint32]
+        SLSCopyManagedDisplaySpaces.restype = c_void_p
+
+        spaces_ref = SLSCopyManagedDisplaySpaces(_sls_connection)
+        if not spaces_ref:
+            return {}
+
+        spaces = objc.objc_object(c_void_p=spaces_ref)
+
+        result = {}
+        for display in spaces:
+            if isinstance(display, dict):
+                space_list = display.get('Spaces', [])
+                for i, s in enumerate(space_list):
+                    space_id = s.get('ManagedSpaceID')
+                    if space_id:
+                        # Индекс начинается с 1
+                        result[i + 1] = int(space_id)
+
+        _space_ids_cache = result
+        return result
+    except Exception as e:
+        print(f"get_space_ids error: {e}")
+        return {}
+
+
+def get_window_id_by_title(app_name: str, window_title: str) -> int:
+    """Найти Window ID по имени приложения и заголовку окна"""
+    try:
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID
+        )
+        for w in windows:
+            owner = w.get('kCGWindowOwnerName', '')
+            title = w.get('kCGWindowName', '')
+            if owner == app_name and title == window_title:
+                return w.get('kCGWindowNumber', 0)
+    except:
+        pass
+    return 0
+
+
+def move_window_to_space(window_id: int, target_space_num: int) -> bool:
+    """Переместить окно на указанный Space через SkyLight API"""
+    if not _init_skylight():
+        print("SkyLight not initialized")
+        return False
+
+    space_ids = get_space_ids_map()
+    target_space_id = space_ids.get(target_space_num)
+
+    if not target_space_id:
+        print(f"Space {target_space_num} not found in space_ids: {space_ids}")
+        return False
+
+    try:
+        # Метод 1: SLSMoveWindowsToManagedSpace
+        SLSMoveWindowsToManagedSpace = _skylight.SLSMoveWindowsToManagedSpace
+        SLSMoveWindowsToManagedSpace.argtypes = [c_uint32, c_void_p, c_uint64]
+        SLSMoveWindowsToManagedSpace.restype = c_int
+
+        # Создаём CFArray с одним window ID
+        from CoreFoundation import CFArrayCreate, kCFTypeArrayCallBacks
+        window_ids = [window_id]
+        # Используем objc для создания NSArray
+        ns_array = objc.lookUpClass('NSArray').arrayWithObject_(window_id)
+
+        result = SLSMoveWindowsToManagedSpace(
+            _sls_connection,
+            objc.pyobjc_id(ns_array),
+            target_space_id
+        )
+
+        print(f"SLSMoveWindowsToManagedSpace result: {result}")
+        return result == 0
+
+    except Exception as e:
+        print(f"move_window_to_space error: {e}")
+
+        # Fallback: попробуем SLSSpaceAddWindowsAndRemoveFromSpaces
+        try:
+            # Нужно знать текущий Space окна
+            pass
+        except:
+            pass
+
+        return False
 
 
 def _get_running_apps_map():
@@ -124,6 +252,35 @@ def group_windows_by_app(windows: list) -> dict:
             groups[app] = []
         groups[app].append(w)
     return groups
+
+
+def activate_window(app_name: str, window_title: str):
+    """Активировать конкретное окно приложения"""
+    # Экранируем кавычки в названии
+    escaped_title = window_title.replace('"', '\\"').replace("'", "'\"'\"'")
+    escaped_app = app_name.replace('"', '\\"')
+
+    script = f'''
+    tell application "{escaped_app}"
+        activate
+    end tell
+    delay 0.1
+    tell application "System Events"
+        tell process "{escaped_app}"
+            set frontmost to true
+            try
+                set targetWindow to first window whose name contains "{escaped_title}"
+                perform action "AXRaise" of targetWindow
+            end try
+        end tell
+    end tell
+    '''
+
+    subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
 
 class DragHeader(QFrame):
@@ -363,50 +520,146 @@ class AppItemWidget(QWidget):
             super().mousePressEvent(event)
 
 
-class WindowItemWidget(QWidget):
-    """Виджет отдельного окна (для развёрнутого отображения)"""
+class WindowItemWidget(QFrame):
+    """Виджет отдельного окна (для развёрнутого отображения) с hover, click и drag"""
 
-    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False, app_name: str = ""):
+    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False, app_name: str = "", space_num: int = 0):
         super().__init__()
-        self.setFixedHeight(20)
+        self.app_name = app_name
+        self.window_title = title
+        self.minimized = minimized
+        self.is_active = is_active_space
+        self.space_num = space_num  # Текущий Space окна
+        self._drag_start_pos = None
+
+        self.setFixedHeight(22)
+        self.setMouseTracking(True)
+        if not minimized:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Базовый стиль
+        self.setStyleSheet("background: transparent; border-radius: 4px;")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)  # Минимальные отступы
+        layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(4)
 
         # Маленькая иконка приложения или статус
-        icon_label = QLabel()
-        icon_label.setFixedSize(12, 12)
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(12, 12)
         if minimized:
-            icon_label.setText("📥")
-            icon_label.setFont(QFont(".AppleSystemUIFont", 9))
+            self.icon_label.setText("📥")
+            self.icon_label.setFont(QFont(".AppleSystemUIFont", 9))
         elif app_name:
             pixmap = get_app_icon(app_name, 12)
             if not pixmap.isNull():
-                icon_label.setPixmap(pixmap)
+                self.icon_label.setPixmap(pixmap)
             else:
-                icon_label.setText("•")
-                icon_label.setStyleSheet("color: #888;")
+                self.icon_label.setText("•")
+                self.icon_label.setStyleSheet("color: #888;")
         else:
-            icon_label.setText("•")
+            self.icon_label.setText("•")
             color = '#aaa' if is_active_space else '#666'
-            icon_label.setStyleSheet(f"color: {color};")
-        layout.addWidget(icon_label)
+            self.icon_label.setStyleSheet(f"color: {color};")
+        layout.addWidget(self.icon_label)
 
-        # Название окна - расширенное до края карточки
+        # Название окна
         if minimized:
-            # Помечаем свёрнутые
             display_title = title[:30] + "..." if len(title) > 30 else title
             display_title += " (свёрнуто)"
-            text_color = '#666'
+            self.text_color = '#666'
         else:
             display_title = title[:40] + "..." if len(title) > 40 else title
-            text_color = '#ddd' if is_active_space else '#aaa'
+            self.text_color = '#ddd' if is_active_space else '#aaa'
 
-        title_label = QLabel(display_title)
-        title_label.setFont(QFont(".AppleSystemUIFont", 9))
-        title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
-        layout.addWidget(title_label, 1)  # stretch=1 чтобы занял всё место
+        self.title_label = QLabel(display_title)
+        self.title_label.setFont(QFont(".AppleSystemUIFont", 9))
+        self.title_label.setStyleSheet(f"color: {self.text_color}; background: transparent;")
+        layout.addWidget(self.title_label, 1)
+
+        self._update_style(hovered=False)
+
+    def _update_style(self, hovered: bool):
+        if self.minimized:
+            self.setStyleSheet("WindowItemWidget { background: transparent; }")
+        elif hovered:
+            # Яркая голубая подсветка как в macOS
+            self.setStyleSheet("WindowItemWidget { background: rgba(10, 132, 255, 0.5); border-radius: 4px; }")
+        else:
+            self.setStyleSheet("WindowItemWidget { background: transparent; border-radius: 4px; }")
+
+    def enterEvent(self, event):
+        if not self.minimized:
+            self._update_style(hovered=True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._update_style(hovered=False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.minimized:
+            # Сохраняем позицию для определения drag
+            self._drag_start_pos = event.pos()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self.minimized and self._drag_start_pos is not None:
+            # Проверяем дистанцию для начала drag
+            if (event.pos() - self._drag_start_pos).manhattanLength() > 10:
+                self._start_drag()
+                self._drag_start_pos = None
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.minimized:
+            if self._drag_start_pos is not None:
+                # Это был клик, не drag — активируем окно
+                self._drag_start_pos = None
+                activate_window(self.app_name, self.window_title)
+                main_window = self.window()
+                if main_window:
+                    QTimer.singleShot(300, main_window.hide)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def _start_drag(self):
+        """Начать drag операцию"""
+        drag = QDrag(self)
+        mime_data = QMimeData()
+
+        # Сохраняем информацию об окне в MIME
+        data = json.dumps({
+            "app_name": self.app_name,
+            "window_title": self.window_title,
+            "source_space": self.space_num
+        })
+        mime_data.setData("application/x-space-window", data.encode())
+        mime_data.setText(f"{self.app_name}: {self.window_title}")
+
+        drag.setMimeData(mime_data)
+
+        # Создаём визуализацию drag
+        pixmap = QPixmap(180, 24)
+        pixmap.fill(QColor(40, 40, 42, 220))
+        painter = QPainter(pixmap)
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont(".AppleSystemUIFont", 10))
+        text = f"{self.app_name}: {self.window_title[:20]}..."
+        painter.drawText(5, 16, text)
+        painter.end()
+
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(pixmap.rect().center())
+
+        # Меняем курсор на drag
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        drag.exec(Qt.DropAction.MoveAction)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
 class SpaceCard(QFrame):
@@ -420,10 +673,12 @@ class SpaceCard(QFrame):
         self.is_active = is_active
         self.exists = exists
         self._glow_animation = None
+        self._is_drop_target = False  # Для визуализации drop
 
         self.setFixedSize(250, 190)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setAcceptDrops(True)  # Принимаем drop
         self.init_ui()
         self.update_style()
 
@@ -447,7 +702,7 @@ class SpaceCard(QFrame):
 
         header.addStretch()
 
-        # Кнопка редактирования title
+        # Кнопка редактирования title (скрыта по умолчанию)
         if self.exists:
             self.edit_btn = QPushButton("✎")
             self.edit_btn.setFixedSize(20, 20)
@@ -465,7 +720,10 @@ class SpaceCard(QFrame):
                 }
             """)
             self.edit_btn.clicked.connect(self._on_edit_click)
+            self.edit_btn.hide()  # Скрыта по умолчанию
             header.addWidget(self.edit_btn)
+        else:
+            self.edit_btn = None
 
         layout.addLayout(header)
 
@@ -540,12 +798,102 @@ class SpaceCard(QFrame):
         self.space_name = name
         self.name_label.setText(name if name else "")
 
+    def enterEvent(self, event):
+        """Показать кнопку редактирования при наведении"""
+        if self.edit_btn:
+            self.edit_btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Скрыть кнопку редактирования"""
+        if self.edit_btn:
+            self.edit_btn.hide()
+        super().leaveEvent(event)
+
     def _on_edit_click(self):
         """Клик на кнопку редактирования"""
         # Находим главное окно и вызываем rename_space
         main_window = self.window()
         if hasattr(main_window, 'rename_space'):
             main_window.rename_space(self.space_num)
+
+    # === Drag-n-drop support ===
+
+    def dragEnterEvent(self, event):
+        """Принимаем drag если это окно"""
+        if event.mimeData().hasFormat("application/x-space-window"):
+            # Парсим данные чтобы проверить source
+            try:
+                data = json.loads(bytes(event.mimeData().data("application/x-space-window")).decode())
+                source_space = data.get("source_space", 0)
+                # Не принимаем drop на тот же Space
+                if source_space != self.space_num:
+                    event.acceptProposedAction()
+                    self._is_drop_target = True
+                    self._update_drop_style()
+                    return
+            except:
+                pass
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Убираем подсветку при выходе"""
+        self._is_drop_target = False
+        self.update_style()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        """Обрабатываем drop — перемещаем окно"""
+        self._is_drop_target = False
+        self.update_style()
+
+        if not event.mimeData().hasFormat("application/x-space-window"):
+            event.ignore()
+            return
+
+        try:
+            data = json.loads(bytes(event.mimeData().data("application/x-space-window")).decode())
+            app_name = data.get("app_name", "")
+            window_title = data.get("window_title", "")
+            source_space = data.get("source_space", 0)
+
+            if source_space == self.space_num:
+                event.ignore()
+                return
+
+            # Находим Window ID
+            window_id = get_window_id_by_title(app_name, window_title)
+            if window_id:
+                print(f"Moving window {window_id} ({app_name}: {window_title}) from Space {source_space} to Space {self.space_num}")
+
+                # Перемещаем окно
+                success = move_window_to_space(window_id, self.space_num)
+
+                if success:
+                    event.acceptProposedAction()
+                    # Обновляем UI
+                    main_window = self.window()
+                    if hasattr(main_window, 'refresh_apps'):
+                        QTimer.singleShot(500, main_window.refresh_apps)
+                    return
+
+            event.ignore()
+
+        except Exception as e:
+            print(f"Drop error: {e}")
+            event.ignore()
+
+    def _update_drop_style(self):
+        """Стиль при наведении drag"""
+        if self._is_drop_target:
+            self.setStyleSheet("""
+                SpaceCard {
+                    background-color: rgba(52, 199, 89, 0.6);
+                    border: 2px dashed rgba(255, 255, 255, 0.5);
+                    border-radius: 12px;
+                }
+                QLabel { color: #ffffff; background: transparent; }
+            """)
 
     def set_apps(self, windows: list):
         """Установить список окон - каждое окно отдельной строкой с иконкой"""
@@ -573,7 +921,7 @@ class SpaceCard(QFrame):
             title = w.get("title", "") if isinstance(w, dict) else str(w)
             minimized = w.get("minimized", False) if isinstance(w, dict) else False
             if title:
-                win_widget = WindowItemWidget(title, self.is_active, minimized, app_name)
+                win_widget = WindowItemWidget(title, self.is_active, minimized, app_name, self.space_num)
                 self.apps_layout.addWidget(win_widget)
 
         # Если окон больше 5 - добавить "Смотреть все"
@@ -599,7 +947,7 @@ class SpaceCard(QFrame):
             self.apps_layout.addWidget(see_all_btn)
 
     def _show_all_windows_menu(self, button):
-        """Показать QMenu со всеми окнами"""
+        """Показать QMenu со всеми окнами — клик активирует окно"""
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -632,9 +980,21 @@ class SpaceCard(QFrame):
                 action = QAction(f"{prefix}{app_name}: {display_title}", menu)
                 if minimized:
                     action.setEnabled(False)
+                else:
+                    # Подключаем активацию окна при клике
+                    action.triggered.connect(
+                        lambda checked, a=app_name, t=title: self._activate_and_hide(a, t)
+                    )
                 menu.addAction(action)
 
         menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _activate_and_hide(self, app_name: str, title: str):
+        """Активировать окно и скрыть Space Manager"""
+        activate_window(app_name, title)
+        main_window = self.window()
+        if main_window:
+            QTimer.singleShot(300, main_window.hide)
 
     def mousePressEvent(self, event):
         if not self.exists:
@@ -967,6 +1327,13 @@ class SpaceManager(QMainWindow):
         scan_btn.setStyleSheet(btn_style)
         controls.addWidget(scan_btn)
 
+        # Кнопка для свёрнутых окон
+        self.minimized_btn = QPushButton("📥")
+        self.minimized_btn.setToolTip("Свёрнутые окна")
+        self.minimized_btn.clicked.connect(self.show_minimized_menu)
+        self.minimized_btn.setStyleSheet(btn_style)
+        controls.addWidget(self.minimized_btn)
+
         controls.addStretch()
 
         settings_btn = QPushButton("Settings")
@@ -1151,32 +1518,99 @@ class SpaceManager(QMainWindow):
         self.show_and_raise()
 
     def _update_apps_ui(self, windows):
-        """Обновить UI с окнами"""
+        """Обновить UI с окнами (без свёрнутых - они отдельно)"""
         active = self.config.get("active_space", 1)
 
-        # Сохранить окна для текущего Space (только видимые, без свёрнутых)
+        # Сохранить окна для текущего Space (только видимые)
         if "space_windows" not in self.config:
             self.config["space_windows"] = {}
         if windows:
             self.config["space_windows"][str(active)] = windows[:10]
             self.save_config()
 
-        # Получаем глобальные свёрнутые окна
-        minimized = self.config.get("minimized_windows", [])
+        # Обновить счётчик свёрнутых на кнопке
+        minimized_count = len(self.config.get("minimized_windows", []))
+        if minimized_count > 0:
+            self.minimized_btn.setText(f"📥 {minimized_count}")
+        else:
+            self.minimized_btn.setText("📥")
 
-        # Показать окна на всех карточках
+        # Показать окна на всех карточках (БЕЗ свёрнутых)
         for num, card in self.space_cards.items():
             saved_windows = self.config.get("space_windows", {}).get(str(num), [])
 
-            if num == active:
-                # Текущий Space: видимые окна + свёрнутые (глобальные)
-                all_windows = list(windows) + minimized if windows else minimized
-                card.set_apps(all_windows)
+            if num == active and windows:
+                card.set_apps(windows)
             elif saved_windows:
-                # Другие Space: только сохранённые видимые окна (без свёрнутых!)
                 card.set_apps(saved_windows)
             else:
                 card.set_apps([])
+
+    def show_minimized_menu(self):
+        """Показать меню со свёрнутыми окнами"""
+        minimized = self.config.get("minimized_windows", [])
+
+        if not minimized:
+            # Пустое меню
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu {
+                    background-color: rgba(40, 40, 42, 0.95);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 8px;
+                    padding: 8px;
+                }
+                QMenu::item {
+                    color: #888;
+                    padding: 8px 16px;
+                    font-size: 12px;
+                }
+            """)
+            action = QAction("Нет свёрнутых окон", menu)
+            action.setEnabled(False)
+            menu.addAction(action)
+            menu.exec(self.minimized_btn.mapToGlobal(self.minimized_btn.rect().topLeft()))
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: rgba(40, 40, 42, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #ffffff;
+                padding: 6px 16px 6px 10px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(10, 132, 255, 0.8);
+            }
+        """)
+
+        for w in minimized:
+            app_name = w.get("app", "")
+            title = w.get("title", "")
+            if title:
+                display_title = title[:45] + "..." if len(title) > 45 else title
+                action = QAction(f"📥 {app_name}: {display_title}", menu)
+                # При клике разворачиваем окно
+                action.triggered.connect(
+                    lambda checked, a=app_name, t=title: self._unminimize_window(a, t)
+                )
+                menu.addAction(action)
+
+        menu.exec(self.minimized_btn.mapToGlobal(self.minimized_btn.rect().topLeft()))
+
+    def _unminimize_window(self, app_name: str, title: str):
+        """Развернуть свёрнутое окно"""
+        # Активируем приложение - это автоматически развернёт окно
+        activate_window(app_name, title)
+        QTimer.singleShot(500, self.refresh_apps)  # Обновить список
+        QTimer.singleShot(300, self.hide)
 
     def switch_to_space(self, space_num: int):
         if space_num > self.config["total_spaces"]:
