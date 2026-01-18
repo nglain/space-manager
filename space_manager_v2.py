@@ -18,10 +18,16 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QPushButton,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSystemTrayIcon,
     QMenu, QDialog, QSpinBox, QMessageBox, QFrame, QScrollArea,
-    QGraphicsDropShadowEffect, QGraphicsBlurEffect
+    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QMetaObject, Q_ARG, pyqtSignal, QObject
+from PyQt6.QtCore import (
+    Qt, QTimer, QSize, QMetaObject, Q_ARG, pyqtSignal, QObject,
+    QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup
+)
 from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase
+from AppKit import NSWorkspace, NSImage
+from Foundation import NSURL
+import objc
 from pynput import keyboard
 import Quartz
 from Quartz import (
@@ -32,6 +38,49 @@ from Quartz import (
 )
 
 CONFIG_PATH = Path.home() / "Клэр" / "apps" / "space-manager" / "config.json"
+
+# Кэш иконок приложений
+_app_icon_cache = {}
+
+
+def get_app_icon(app_name: str, size: int = 20) -> QPixmap:
+    """Получить иконку приложения через NSWorkspace"""
+    cache_key = f"{app_name}_{size}"
+    if cache_key in _app_icon_cache:
+        return _app_icon_cache[cache_key]
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    try:
+        workspace = NSWorkspace.sharedWorkspace()
+        # Найти путь к приложению
+        app_path = workspace.fullPathForApplication_(app_name)
+        if app_path:
+            # Получить иконку
+            icon = workspace.iconForFile_(app_path)
+            if icon:
+                # Конвертировать NSImage в QPixmap
+                icon.setSize_((size, size))
+                tiff_data = icon.TIFFRepresentation()
+                if tiff_data:
+                    pixmap.loadFromData(bytes(tiff_data))
+    except Exception as e:
+        pass  # Вернём пустую иконку
+
+    _app_icon_cache[cache_key] = pixmap
+    return pixmap
+
+
+def group_windows_by_app(windows: list) -> dict:
+    """Группировать окна по приложениям"""
+    groups = {}
+    for w in windows:
+        app = w.get("app", "Unknown") if isinstance(w, dict) else str(w)
+        if app not in groups:
+            groups[app] = []
+        groups[app].append(w)
+    return groups
 
 
 class DragHeader(QFrame):
@@ -179,8 +228,42 @@ def get_space_count():
     return 9  # Вернём максимум по умолчанию
 
 
+class AppIconWidget(QWidget):
+    """Виджет с иконкой приложения и количеством окон"""
+
+    def __init__(self, app_name: str, count: int, is_active_space: bool = False):
+        super().__init__()
+        self.setFixedHeight(24)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # Иконка
+        icon_label = QLabel()
+        pixmap = get_app_icon(app_name, 18)
+        if not pixmap.isNull():
+            icon_label.setPixmap(pixmap)
+        else:
+            icon_label.setText("●")
+            icon_label.setStyleSheet(f"color: {'#fff' if is_active_space else '#888'}; font-size: 8px;")
+        icon_label.setFixedSize(18, 18)
+        layout.addWidget(icon_label)
+
+        # Название + количество
+        text = app_name[:18]
+        if count > 1:
+            text += f" ({count})"
+        name_label = QLabel(text)
+        name_label.setFont(QFont(".AppleSystemUIFont", 11))
+        name_label.setStyleSheet(f"color: {'#fff' if is_active_space else '#c5c5c7'}; background: transparent;")
+        layout.addWidget(name_label)
+
+        layout.addStretch()
+
+
 class SpaceCard(QFrame):
-    """Карточка для одного Space — Apple style"""
+    """Карточка для одного Space — Apple style с иконками и анимациями"""
 
     def __init__(self, space_num: int, name: str = "", apps: list = None, is_active: bool = False, exists: bool = True):
         super().__init__()
@@ -189,8 +272,9 @@ class SpaceCard(QFrame):
         self.apps = apps or []
         self.is_active = is_active
         self.exists = exists
+        self._glow_animation = None
 
-        self.setFixedSize(200, 160)
+        self.setFixedSize(200, 150)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.init_ui()
@@ -198,41 +282,32 @@ class SpaceCard(QFrame):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(4)
 
-        # Заголовок: номер + счётчик окон
+        # Заголовок: номер
         header = QHBoxLayout()
         header.setSpacing(8)
 
         self.num_label = QLabel(str(self.space_num))
-        self.num_label.setFont(QFont(".AppleSystemUIFont", 20, QFont.Weight.Medium))
+        self.num_label.setFont(QFont(".AppleSystemUIFont", 18, QFont.Weight.Medium))
         header.addWidget(self.num_label)
 
         header.addStretch()
-
-        self.win_count = QLabel("")
-        self.win_count.setFont(QFont(".AppleSystemUIFont", 11))
-        header.addWidget(self.win_count)
-
         layout.addLayout(header)
 
         # Название
         self.name_label = QLabel(self.space_name or f"Desktop {self.space_num}")
-        self.name_label.setFont(QFont(".AppleSystemUIFont", 12, QFont.Weight.Medium))
-        self.name_label.setWordWrap(True)
+        self.name_label.setFont(QFont(".AppleSystemUIFont", 11, QFont.Weight.Medium))
         layout.addWidget(self.name_label)
 
-        # Разделитель
-        self.separator = QFrame()
-        self.separator.setFixedHeight(1)
-        layout.addWidget(self.separator)
-
-        # Приложения
-        self.apps_label = QLabel("")
-        self.apps_label.setFont(QFont(".AppleSystemUIFont", 10))
-        self.apps_label.setWordWrap(True)
-        layout.addWidget(self.apps_label)
+        # Контейнер для иконок приложений
+        self.apps_container = QWidget()
+        self.apps_container.setStyleSheet("background: transparent;")
+        self.apps_layout = QVBoxLayout(self.apps_container)
+        self.apps_layout.setContentsMargins(0, 4, 0, 0)
+        self.apps_layout.setSpacing(2)
+        layout.addWidget(self.apps_container)
 
         layout.addStretch()
 
@@ -240,37 +315,54 @@ class SpaceCard(QFrame):
         if not self.exists:
             self.setStyleSheet("""
                 SpaceCard {
-                    background-color: rgba(30, 30, 30, 0.4);
+                    background-color: rgba(30, 30, 30, 0.3);
                     border: none;
                     border-radius: 12px;
                 }
                 QLabel { color: #3a3a3a; background: transparent; }
-                QFrame { background: transparent; }
             """)
-            self.separator.setStyleSheet("background-color: #2a2a2a;")
+            self._stop_glow()
         elif self.is_active:
             self.setStyleSheet("""
                 SpaceCard {
-                    background-color: rgba(10, 132, 255, 0.85);
+                    background-color: rgba(10, 132, 255, 0.9);
                     border: none;
                     border-radius: 12px;
                 }
                 QLabel { color: #ffffff; background: transparent; }
             """)
-            self.separator.setStyleSheet("background-color: rgba(255,255,255,0.2);")
+            self._start_glow()
         else:
             self.setStyleSheet("""
                 SpaceCard {
-                    background-color: rgba(58, 58, 60, 0.6);
+                    background-color: rgba(58, 58, 60, 0.5);
                     border: none;
                     border-radius: 12px;
                 }
                 SpaceCard:hover {
-                    background-color: rgba(72, 72, 74, 0.8);
+                    background-color: rgba(72, 72, 74, 0.7);
                 }
-                QLabel { color: #e5e5e7; background: transparent; }
+                QLabel { color: #d5d5d7; background: transparent; }
             """)
-            self.separator.setStyleSheet("background-color: rgba(255,255,255,0.08);")
+            self._stop_glow()
+
+    def _start_glow(self):
+        """Запустить анимацию свечения для активного Space"""
+        if self._glow_animation:
+            return
+
+        # Создаём эффект тени для свечения
+        glow = QGraphicsDropShadowEffect()
+        glow.setBlurRadius(20)
+        glow.setXOffset(0)
+        glow.setYOffset(0)
+        glow.setColor(QColor(10, 132, 255, 150))
+        self.setGraphicsEffect(glow)
+
+    def _stop_glow(self):
+        """Остановить анимацию свечения"""
+        self.setGraphicsEffect(None)
+        self._glow_animation = None
 
     def set_active(self, active: bool):
         self.is_active = active
@@ -281,22 +373,29 @@ class SpaceCard(QFrame):
         self.name_label.setText(name or f"Desktop {self.space_num}")
 
     def set_apps(self, windows: list):
-        """Установить список окон для отображения"""
+        """Установить список окон с иконками"""
         self.apps = windows
-        if windows:
-            lines = []
-            for w in windows[:4]:  # До 4 окон
-                if isinstance(w, dict):
-                    display = w.get("display", w.get("name", "?"))
-                    lines.append(display[:30])
-                else:
-                    lines.append(str(w)[:30])
 
-            self.apps_label.setText("\n".join(lines))
-            self.win_count.setText(str(len(windows)))
-        else:
-            self.apps_label.setText("Empty")
-            self.win_count.setText("")
+        # Очистить старые виджеты
+        while self.apps_layout.count():
+            item = self.apps_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not windows:
+            empty_label = QLabel("Empty")
+            empty_label.setFont(QFont(".AppleSystemUIFont", 10))
+            empty_label.setStyleSheet(f"color: {'#888' if not self.is_active else '#aaa'}; background: transparent;")
+            self.apps_layout.addWidget(empty_label)
+            return
+
+        # Группировать по приложениям
+        groups = group_windows_by_app(windows)
+
+        # Показать до 4 приложений с иконками
+        for app_name, app_windows in list(groups.items())[:4]:
+            widget = AppIconWidget(app_name, len(app_windows), self.is_active)
+            self.apps_layout.addWidget(widget)
 
     def mousePressEvent(self, event):
         if not self.exists:
@@ -742,11 +841,22 @@ class SpaceManager(QMainWindow):
             self.show_and_raise()
 
     def show_and_raise(self):
+        # Fade-in анимация
+        self.setWindowOpacity(0)
         self.show()
         self.raise_()
         self.activateWindow()
         self.center_on_screen()
-        # Обновить приложения синхронно (Quartz быстрый)
+
+        # Плавное появление
+        self._fade_animation = QPropertyAnimation(self, b"windowOpacity")
+        self._fade_animation.setDuration(150)
+        self._fade_animation.setStartValue(0)
+        self._fade_animation.setEndValue(1)
+        self._fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_animation.start()
+
+        # Обновить приложения
         self.refresh_apps()
 
     def refresh_apps(self):
@@ -873,9 +983,23 @@ class SpaceManager(QMainWindow):
             self.rebuild_grid()
             self.setup_tray()
 
+    def hide_animated(self):
+        """Плавное скрытие окна"""
+        self._hide_animation = QPropertyAnimation(self, b"windowOpacity")
+        self._hide_animation.setDuration(100)
+        self._hide_animation.setStartValue(1)
+        self._hide_animation.setEndValue(0)
+        self._hide_animation.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._hide_animation.finished.connect(self._do_hide)
+        self._hide_animation.start()
+
+    def _do_hide(self):
+        self.hide()
+        self.setWindowOpacity(1)
+
     def closeEvent(self, event):
         event.ignore()
-        self.hide()
+        self.hide_animated()
 
 
 class HotkeySignal(QObject):
