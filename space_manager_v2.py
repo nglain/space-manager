@@ -366,38 +366,47 @@ class AppItemWidget(QWidget):
 class WindowItemWidget(QWidget):
     """Виджет отдельного окна (для развёрнутого отображения)"""
 
-    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False):
+    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False, app_name: str = ""):
         super().__init__()
-        self.setFixedHeight(18)
+        self.setFixedHeight(20)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 0, 0, 0)  # Отступ слева
+        layout.setContentsMargins(4, 0, 4, 0)  # Минимальные отступы
         layout.setSpacing(4)
 
-        # Маркер (свёрнутые - специальная иконка)
+        # Маленькая иконка приложения или статус
+        icon_label = QLabel()
+        icon_label.setFixedSize(12, 12)
         if minimized:
-            bullet = QLabel("📥")
-            bullet.setFont(QFont(".AppleSystemUIFont", 8))
+            icon_label.setText("📥")
+            icon_label.setFont(QFont(".AppleSystemUIFont", 9))
+        elif app_name:
+            pixmap = get_app_icon(app_name, 12)
+            if not pixmap.isNull():
+                icon_label.setPixmap(pixmap)
+            else:
+                icon_label.setText("•")
+                icon_label.setStyleSheet("color: #888;")
         else:
-            bullet = QLabel("›")
-            bullet.setFont(QFont(".AppleSystemUIFont", 10))
-        bullet.setFixedWidth(14)
-        color = '#666' if minimized else ('#aaa' if is_active_space else '#777')
-        bullet.setStyleSheet(f"color: {color}; background: transparent;")
-        layout.addWidget(bullet)
+            icon_label.setText("•")
+            color = '#aaa' if is_active_space else '#666'
+            icon_label.setStyleSheet(f"color: {color};")
+        layout.addWidget(icon_label)
 
-        # Название окна (свёрнутые - серым)
-        title_short = title[:22] + "..." if len(title) > 22 else title
-        title_label = QLabel(title_short)
-        title_label.setFont(QFont(".AppleSystemUIFont", 9))
+        # Название окна - расширенное до края карточки
         if minimized:
+            # Помечаем свёрнутые
+            display_title = title[:30] + "..." if len(title) > 30 else title
+            display_title += " (свёрнуто)"
             text_color = '#666'
         else:
+            display_title = title[:40] + "..." if len(title) > 40 else title
             text_color = '#ddd' if is_active_space else '#aaa'
-        title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
-        layout.addWidget(title_label)
 
-        layout.addStretch()
+        title_label = QLabel(display_title)
+        title_label.setFont(QFont(".AppleSystemUIFont", 9))
+        title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
+        layout.addWidget(title_label, 1)  # stretch=1 чтобы занял всё место
 
 
 class SpaceCard(QFrame):
@@ -412,7 +421,7 @@ class SpaceCard(QFrame):
         self.exists = exists
         self._glow_animation = None
 
-        self.setFixedSize(230, 175)
+        self.setFixedSize(250, 190)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.init_ui()
@@ -423,21 +432,42 @@ class SpaceCard(QFrame):
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(4)
 
-        # Заголовок: номер
+        # Заголовок: номер + редактируемый title
         header = QHBoxLayout()
-        header.setSpacing(8)
+        header.setSpacing(6)
 
         self.num_label = QLabel(str(self.space_num))
         self.num_label.setFont(QFont(".AppleSystemUIFont", 18, QFont.Weight.Medium))
         header.addWidget(self.num_label)
 
-        header.addStretch()
-        layout.addLayout(header)
+        # Редактируемый title рядом с номером
+        self.name_label = QLabel(self.space_name if self.space_name else "")
+        self.name_label.setFont(QFont(".AppleSystemUIFont", 12))
+        header.addWidget(self.name_label)
 
-        # Название
-        self.name_label = QLabel(self.space_name or f"Desktop {self.space_num}")
-        self.name_label.setFont(QFont(".AppleSystemUIFont", 11, QFont.Weight.Medium))
-        layout.addWidget(self.name_label)
+        header.addStretch()
+
+        # Кнопка редактирования title
+        if self.exists:
+            self.edit_btn = QPushButton("✎")
+            self.edit_btn.setFixedSize(20, 20)
+            self.edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.edit_btn.setToolTip("Редактировать название")
+            self.edit_btn.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    border: none;
+                    font-size: 12px;
+                    color: #888;
+                }
+                QPushButton:hover {
+                    color: #fff;
+                }
+            """)
+            self.edit_btn.clicked.connect(self._on_edit_click)
+            header.addWidget(self.edit_btn)
+
+        layout.addLayout(header)
 
         # Контейнер для иконок приложений
         self.apps_container = QWidget()
@@ -508,14 +538,19 @@ class SpaceCard(QFrame):
 
     def set_name(self, name: str):
         self.space_name = name
-        self.name_label.setText(name or f"Desktop {self.space_num}")
+        self.name_label.setText(name if name else "")
 
-    # Приложения которые всегда показываем развёрнуто
-    EXPANDED_APPS = {'Terminal', 'Терминал', 'iTerm2', 'iTerm', 'Warp', 'Alacritty', 'Hyper'}
+    def _on_edit_click(self):
+        """Клик на кнопку редактирования"""
+        # Находим главное окно и вызываем rename_space
+        main_window = self.window()
+        if hasattr(main_window, 'rename_space'):
+            main_window.rename_space(self.space_num)
 
     def set_apps(self, windows: list):
-        """Установить список окон: Terminal развёрнуто, остальные свёрнуто"""
+        """Установить список окон - каждое окно отдельной строкой с иконкой"""
         self.apps = windows
+        self._all_windows = windows  # Сохраняем для QMenu
 
         # Очистить старые виджеты
         while self.apps_layout.count():
@@ -530,40 +565,76 @@ class SpaceCard(QFrame):
             self.apps_layout.addWidget(empty_label)
             return
 
-        # Группировать по приложениям
-        groups = group_windows_by_app(windows)
+        max_visible = 5  # Показываем до 5 окон напрямую
 
-        items_shown = 0
-        max_items = 5  # Максимум элементов в карточке
+        # Показываем первые окна
+        for i, w in enumerate(windows[:max_visible]):
+            app_name = w.get("app", "") if isinstance(w, dict) else ""
+            title = w.get("title", "") if isinstance(w, dict) else str(w)
+            minimized = w.get("minimized", False) if isinstance(w, dict) else False
+            if title:
+                win_widget = WindowItemWidget(title, self.is_active, minimized, app_name)
+                self.apps_layout.addWidget(win_widget)
 
-        for app_name, app_windows in groups.items():
-            if items_shown >= max_items:
-                break
+        # Если окон больше 5 - добавить "Смотреть все"
+        if len(windows) > max_visible:
+            see_all_btn = QPushButton(f"Смотреть все ({len(windows)})...")
+            see_all_btn.setFont(QFont(".AppleSystemUIFont", 9))
+            see_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            see_all_btn.setFixedHeight(20)
+            text_color = '#aaa' if self.is_active else '#888'
+            see_all_btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {text_color};
+                    background: transparent;
+                    border: none;
+                    text-align: left;
+                    padding-left: 4px;
+                }}
+                QPushButton:hover {{
+                    color: #fff;
+                }}
+            """)
+            see_all_btn.clicked.connect(lambda: self._show_all_windows_menu(see_all_btn))
+            self.apps_layout.addWidget(see_all_btn)
 
-            # Проверяем нужно ли развернуть это приложение
-            is_expanded_app = app_name in self.EXPANDED_APPS
+    def _show_all_windows_menu(self, button):
+        """Показать QMenu со всеми окнами"""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: rgba(40, 40, 42, 0.95);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #ffffff;
+                padding: 5px 15px 5px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(10, 132, 255, 0.8);
+            }
+            QMenu::item:disabled {
+                color: #666;
+            }
+        """)
 
-            if is_expanded_app:
-                # Показываем иконку приложения
-                app_widget = AppItemWidget(app_name, [], self.is_active)  # Пустой список - без счётчика
-                self.apps_layout.addWidget(app_widget)
-                items_shown += 1
+        for w in self._all_windows:
+            app_name = w.get("app", "") if isinstance(w, dict) else ""
+            title = w.get("title", "") if isinstance(w, dict) else str(w)
+            minimized = w.get("minimized", False) if isinstance(w, dict) else False
+            if title:
+                display_title = title[:50] + "..." if len(title) > 50 else title
+                prefix = "📥 " if minimized else ""
+                action = QAction(f"{prefix}{app_name}: {display_title}", menu)
+                if minimized:
+                    action.setEnabled(False)
+                menu.addAction(action)
 
-                # Показываем каждое окно отдельно
-                for w in app_windows[:3]:  # Макс 3 окна терминала
-                    if items_shown >= max_items:
-                        break
-                    title = w.get("title", "") if isinstance(w, dict) else str(w)
-                    minimized = w.get("minimized", False) if isinstance(w, dict) else False
-                    if title:
-                        win_widget = WindowItemWidget(title, self.is_active, minimized)
-                        self.apps_layout.addWidget(win_widget)
-                        items_shown += 1
-            else:
-                # Свёрнутое отображение с QMenu
-                widget = AppItemWidget(app_name, app_windows, self.is_active)
-                self.apps_layout.addWidget(widget)
-                items_shown += 1
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
 
     def mousePressEvent(self, event):
         if not self.exists:
@@ -726,17 +797,9 @@ class RenameDialog(QDialog):
 
         self.name_edit = QLineEdit()
         self.name_edit.setText(current_name)
-        self.name_edit.setPlaceholderText("Например: 🚀 API, 🎨 Frontend, 📚 Research...")
+        self.name_edit.setPlaceholderText("Название...")
         self.name_edit.selectAll()
         layout.addWidget(self.name_edit)
-
-        # Быстрые варианты
-        quick_layout = QHBoxLayout()
-        for emoji_name in ["🚀 Dev", "🎨 Design", "📚 Docs", "🧪 Test"]:
-            btn = QPushButton(emoji_name)
-            btn.clicked.connect(lambda checked, n=emoji_name: self.name_edit.setText(n))
-            quick_layout.addWidget(btn)
-        layout.addLayout(quick_layout)
 
         buttons_layout = QHBoxLayout()
         save_btn = QPushButton("Сохранить")
@@ -944,9 +1007,7 @@ class SpaceManager(QMainWindow):
                 if exists:
                     card.set_apps(saved_windows)  # Показать сохранённые окна сразу
                 else:
-                    card.name_label.setText("—")
-                    card.apps_label.setText("")
-                    card.win_count.setText("")
+                    card.name_label.setText("")  # Пустой для несуществующих
 
                 self.grid_layout.addWidget(card, row, col)
                 self.space_cards[space_num] = card
@@ -1028,9 +1089,25 @@ class SpaceManager(QMainWindow):
         self.refresh_apps()
 
     def refresh_apps(self):
-        """Обновить список окон включая свёрнутые"""
-        windows = get_windows_on_current_space(include_minimized=True)
-        self._update_apps_ui(windows)
+        """Обновить список окон - свёрнутые хранятся отдельно"""
+        # Получаем только видимые окна для текущего Space
+        visible_windows = get_windows_on_current_space(include_minimized=False)
+
+        # Получаем все окна чтобы найти свёрнутые
+        all_windows = get_windows_on_current_space(include_minimized=True)
+
+        # Свёрнутые = все минус видимые (по title+app)
+        visible_keys = {(w["app"], w["title"]) for w in visible_windows}
+        minimized_windows = [w for w in all_windows if (w["app"], w["title"]) not in visible_keys]
+
+        # Помечаем свёрнутые
+        for w in minimized_windows:
+            w["minimized"] = True
+
+        # Сохраняем свёрнутые отдельно (глобально, не для Space)
+        self.config["minimized_windows"] = minimized_windows[:10]
+
+        self._update_apps_ui(visible_windows)
 
     def scan_all_spaces(self):
         """Пройтись по всем Spaces и собрать окна"""
@@ -1049,8 +1126,8 @@ class SpaceManager(QMainWindow):
             subprocess.run(["osascript", "-e", script], capture_output=True, timeout=2)
             time.sleep(0.3)  # Подождать переключения
 
-            # Собрать окна (включая свёрнутые)
-            windows = get_windows_on_current_space(include_minimized=True)
+            # Собрать только видимые окна (свёрнутые глобальные - не привязаны к Space)
+            windows = get_windows_on_current_space(include_minimized=False)
             if windows:
                 if "space_windows" not in self.config:
                     self.config["space_windows"] = {}
@@ -1077,20 +1154,27 @@ class SpaceManager(QMainWindow):
         """Обновить UI с окнами"""
         active = self.config.get("active_space", 1)
 
-        # Сохранить окна для текущего Space
+        # Сохранить окна для текущего Space (только видимые, без свёрнутых)
         if "space_windows" not in self.config:
             self.config["space_windows"] = {}
         if windows:
-            self.config["space_windows"][str(active)] = windows[:10]  # до 10 окон
+            self.config["space_windows"][str(active)] = windows[:10]
             self.save_config()
 
-        # Показать окна на всех карточках (из сохранённых данных)
+        # Получаем глобальные свёрнутые окна
+        minimized = self.config.get("minimized_windows", [])
+
+        # Показать окна на всех карточках
         for num, card in self.space_cards.items():
             saved_windows = self.config.get("space_windows", {}).get(str(num), [])
-            if num == active and windows:
-                card.set_apps(windows)  # Актуальные для текущего
+
+            if num == active:
+                # Текущий Space: видимые окна + свёрнутые (глобальные)
+                all_windows = list(windows) + minimized if windows else minimized
+                card.set_apps(all_windows)
             elif saved_windows:
-                card.set_apps(saved_windows)  # Сохранённые для других
+                # Другие Space: только сохранённые видимые окна (без свёрнутых!)
+                card.set_apps(saved_windows)
             else:
                 card.set_apps([])
 
@@ -1109,9 +1193,6 @@ class SpaceManager(QMainWindow):
 
         self.save_config()
 
-        # Скрыть окно сразу
-        self.hide()
-
         # Асинхронно переключить Space (не блокируя UI)
         # key codes: 18=1, 19=2, 20=3, 21=4, 22=5, 23=6, 24=7, 25=8, 26=9
         key_code = 17 + space_num
@@ -1123,6 +1204,9 @@ class SpaceManager(QMainWindow):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+
+        # Скрыть окно через 2 секунды
+        QTimer.singleShot(2000, self.hide)
 
     def rename_space(self, space_num: int):
         current_name = self.config["space_names"].get(str(space_num), "")
