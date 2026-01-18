@@ -683,7 +683,7 @@ class SpaceManager(QMainWindow):
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setToolTip("Space Manager - Ctrl+Tab для открытия")
+        self.tray_icon.setToolTip("Space Manager - Ctrl+` для открытия")
 
         tray_menu = QMenu()
 
@@ -868,14 +868,20 @@ def main():
     hotkey_signal = HotkeySignal()
     hotkey_signal.toggle.connect(window.show_and_raise)
 
-    # Глобальный hotkey: Ctrl+Tab
+    # Глобальный hotkey: Ctrl+`
     current_keys = set()
+    tilde_codes = {'`', '~', '§', '±'}  # Разные раскладки
 
     def on_press(key):
         current_keys.add(key)
-        # Ctrl + Tab
-        if (keyboard.Key.ctrl in current_keys and
-            keyboard.Key.tab in current_keys):
+        # Ctrl + ` (тильда)
+        is_tilde = False
+        try:
+            if hasattr(key, 'char') and key.char in tilde_codes:
+                is_tilde = True
+        except:
+            pass
+        if keyboard.Key.ctrl in current_keys and is_tilde:
             hotkey_signal.toggle.emit()
 
     def on_release(key):
@@ -887,7 +893,7 @@ def main():
     listener.start()
 
     print("Space Manager запущен!")
-    print("Hotkey: Ctrl+Tab")
+    print("Hotkey: Ctrl+`")
 
     sys.exit(app.exec())
 
