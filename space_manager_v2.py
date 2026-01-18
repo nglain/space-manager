@@ -25,11 +25,9 @@ from PyQt6.QtCore import (
     QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup
 )
 from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase
-from AppKit import NSWorkspace, NSImage, NSBitmapImageRep, NSPNGFileType
+from AppKit import NSWorkspace, NSImage, NSBitmapImageRep, NSPNGFileType, NSRunningApplication
 from Foundation import NSURL, NSData
 import objc
-import tempfile
-import os
 from pynput import keyboard
 import Quartz
 from Quartz import (
@@ -45,37 +43,71 @@ CONFIG_PATH = Path.home() / "Клэр" / "apps" / "space-manager" / "config.json
 _app_icon_cache = {}
 
 
-def get_app_icon(app_name: str, size: int = 20) -> QPixmap:
-    """Получить иконку приложения через NSWorkspace"""
-    cache_key = f"{app_name}_{size}"
+def get_app_icon(app_name: str, target_size: int = 16) -> QPixmap:
+    """Получить иконку приложения - несколько методов поиска"""
+    cache_key = f"{app_name}_{target_size}"
     if cache_key in _app_icon_cache:
         return _app_icon_cache[cache_key]
 
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    icon = None
+    workspace = NSWorkspace.sharedWorkspace()
 
     try:
-        workspace = NSWorkspace.sharedWorkspace()
-        app_path = workspace.fullPathForApplication_(app_name)
-        if app_path:
-            icon = workspace.iconForFile_(app_path)
-            if icon:
-                # Установить размер
-                icon.setSize_((size, size))
+        # Метод 1: Поиск среди запущенных приложений
+        running_apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(None)
+        if running_apps is None:
+            running_apps = workspace.runningApplications()
 
-                # Конвертировать NSImage в PNG через NSBitmapImageRep
-                icon.lockFocus()
-                bitmap = NSBitmapImageRep.alloc().initWithFocusedViewRect_(
-                    ((0, 0), (size, size))
-                )
-                icon.unlockFocus()
+        for app in running_apps or []:
+            if app.localizedName() == app_name:
+                icon = app.icon()
+                break
 
-                if bitmap:
-                    png_data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
-                    if png_data:
-                        pixmap.loadFromData(bytes(png_data))
-    except Exception as e:
-        pass  # Вернём пустую иконку
+        # Метод 2: Поиск по имени приложения
+        if not icon:
+            app_path = workspace.fullPathForApplication_(app_name)
+            if app_path:
+                icon = workspace.iconForFile_(app_path)
+
+        # Метод 3: Поиск с .app суффиксом
+        if not icon:
+            app_path = workspace.fullPathForApplication_(f"{app_name}.app")
+            if app_path:
+                icon = workspace.iconForFile_(app_path)
+
+    except Exception:
+        pass
+
+    # Конвертировать NSImage в QPixmap
+    pixmap = QPixmap(target_size, target_size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    if icon:
+        try:
+            # Рендерим в большем размере для качества, потом масштабируем
+            render_size = 64
+            icon.setSize_((render_size, render_size))
+
+            icon.lockFocus()
+            bitmap = NSBitmapImageRep.alloc().initWithFocusedViewRect_(
+                ((0, 0), (render_size, render_size))
+            )
+            icon.unlockFocus()
+
+            if bitmap:
+                png_data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
+                if png_data:
+                    temp_pixmap = QPixmap()
+                    temp_pixmap.loadFromData(bytes(png_data))
+                    if not temp_pixmap.isNull():
+                        # Масштабируем с высоким качеством
+                        pixmap = temp_pixmap.scaled(
+                            target_size, target_size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+        except Exception:
+            pass
 
     _app_icon_cache[cache_key] = pixmap
     return pixmap
@@ -237,90 +269,58 @@ def get_space_count():
     return 9  # Вернём максимум по умолчанию
 
 
-class AppGroupWidget(QWidget):
-    """Раскрываемый виджет с иконкой приложения и списком окон"""
+class AppItemWidget(QWidget):
+    """Компактный виджет приложения с иконкой и tooltip для окон"""
 
     def __init__(self, app_name: str, windows: list, is_active_space: bool = False):
         super().__init__()
         self.app_name = app_name
         self.windows = windows
         self.is_active = is_active_space
-        self.expanded = False
+        self.setFixedHeight(22)
 
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(2)
-
-        # Заголовок (кликабельный)
-        self.header = QWidget()
-        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
-        header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(6)
-
-        # Стрелка раскрытия
-        self.arrow = QLabel("▶" if len(windows) > 1 else "")
-        self.arrow.setFixedWidth(10)
-        self.arrow.setFont(QFont(".AppleSystemUIFont", 8))
-        color = '#fff' if is_active_space else '#888'
-        self.arrow.setStyleSheet(f"color: {color}; background: transparent;")
-        header_layout.addWidget(self.arrow)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         # Иконка
-        icon_label = QLabel()
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(16, 16)
+        self.icon_label.setScaledContents(False)
         pixmap = get_app_icon(app_name, 16)
         if not pixmap.isNull():
-            icon_label.setPixmap(pixmap)
+            self.icon_label.setPixmap(pixmap)
         else:
-            icon_label.setText("●")
-            icon_label.setStyleSheet(f"color: {color}; font-size: 10px;")
-        icon_label.setFixedSize(16, 16)
-        header_layout.addWidget(icon_label)
+            # Fallback - цветной кружок
+            self.icon_label.setText("●")
+            color = '#fff' if is_active_space else '#888'
+            self.icon_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+            self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.icon_label)
 
         # Название + количество
-        text = app_name[:15]
+        text = app_name[:14]
         if len(windows) > 1:
             text += f" ({len(windows)})"
         self.name_label = QLabel(text)
         self.name_label.setFont(QFont(".AppleSystemUIFont", 10))
-        self.name_label.setStyleSheet(f"color: {'#fff' if is_active_space else '#c5c5c7'}; background: transparent;")
-        header_layout.addWidget(self.name_label)
+        text_color = '#fff' if is_active_space else '#c5c5c7'
+        self.name_label.setStyleSheet(f"color: {text_color}; background: transparent;")
+        layout.addWidget(self.name_label)
 
-        header_layout.addStretch()
-        self.main_layout.addWidget(self.header)
+        layout.addStretch()
 
-        # Контейнер для списка окон (скрыт по умолчанию)
-        self.windows_container = QWidget()
-        self.windows_container.setVisible(False)
-        self.windows_layout = QVBoxLayout(self.windows_container)
-        self.windows_layout.setContentsMargins(26, 0, 0, 0)
-        self.windows_layout.setSpacing(1)
-
-        # Добавить окна
-        for w in windows:
-            title = w.get("title", "") if isinstance(w, dict) else str(w)
-            if title:
-                title = title[:25] + "..." if len(title) > 25 else title
-                win_label = QLabel(f"• {title}")
-                win_label.setFont(QFont(".AppleSystemUIFont", 9))
-                win_label.setStyleSheet(f"color: {'#ccc' if is_active_space else '#999'}; background: transparent;")
-                self.windows_layout.addWidget(win_label)
-
-        self.main_layout.addWidget(self.windows_container)
-
-    def mousePressEvent(self, event):
-        if len(self.windows) > 1 and event.button() == Qt.MouseButton.LeftButton:
-            # Проверить что клик в области заголовка
-            if self.header.geometry().contains(event.pos()):
-                self.toggle_expand()
-                event.accept()
-                return
-        super().mousePressEvent(event)
-
-    def toggle_expand(self):
-        self.expanded = not self.expanded
-        self.windows_container.setVisible(self.expanded)
-        self.arrow.setText("▼" if self.expanded else "▶")
+        # Tooltip с полным списком окон
+        if windows:
+            tooltip_lines = [f"<b>{app_name}</b>"]
+            for w in windows[:10]:  # Макс 10 окон в tooltip
+                title = w.get("title", "") if isinstance(w, dict) else str(w)
+                if title:
+                    title = title[:50] + "..." if len(title) > 50 else title
+                    tooltip_lines.append(f"• {title}")
+            if len(windows) > 10:
+                tooltip_lines.append(f"<i>...и ещё {len(windows) - 10}</i>")
+            self.setToolTip("<br>".join(tooltip_lines))
 
 
 class SpaceCard(QFrame):
@@ -335,8 +335,7 @@ class SpaceCard(QFrame):
         self.exists = exists
         self._glow_animation = None
 
-        self.setFixedWidth(200)
-        self.setMinimumHeight(130)
+        self.setFixedSize(200, 145)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.init_ui()
@@ -435,7 +434,7 @@ class SpaceCard(QFrame):
         self.name_label.setText(name or f"Desktop {self.space_num}")
 
     def set_apps(self, windows: list):
-        """Установить список окон с раскрываемыми группами"""
+        """Установить список окон с иконками (tooltip для деталей)"""
         self.apps = windows
 
         # Очистить старые виджеты
@@ -454,9 +453,9 @@ class SpaceCard(QFrame):
         # Группировать по приложениям
         groups = group_windows_by_app(windows)
 
-        # Показать до 4 приложений с раскрываемыми группами
+        # Показать до 4 приложений (наведи для списка окон)
         for app_name, app_windows in list(groups.items())[:4]:
-            widget = AppGroupWidget(app_name, app_windows, self.is_active)
+            widget = AppItemWidget(app_name, app_windows, self.is_active)
             self.apps_layout.addWidget(widget)
 
     def mousePressEvent(self, event):
