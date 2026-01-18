@@ -127,26 +127,34 @@ def get_window_id_by_title(app_name: str, window_title: str) -> int:
 
 def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
     """
-    Переместить окно на указанный Space через SkyLight API.
+    Переместить окно на указанный Space/Workspace.
 
     Returns: (success: bool, message: str)
 
-    Примечание: На современных версиях macOS эта функция может не работать
-    из-за ограничений безопасности. Для полноценной работы рекомендуется
-    установить yabai (https://github.com/koekeishiya/yabai).
+    Поддерживаемые методы (в порядке приоритета):
+    1. AeroSpace (рекомендуется, не требует SIP)
+    2. yabai (требует частичного отключения SIP)
+    3. SkyLight API (часто не работает на современных macOS)
     """
-    if not _init_skylight():
-        return False, "SkyLight framework недоступен"
+    import subprocess
 
-    space_ids = get_space_ids_map()
-    target_space_id = space_ids.get(target_space_num)
-
-    if not target_space_id:
-        return False, f"Space {target_space_num} не найден"
-
-    # Метод 1: Попробуем через yabai если установлен
+    # Метод 1: AeroSpace (рекомендуется)
     try:
-        import subprocess
+        result = subprocess.run(
+            ['aerospace', 'move-node-to-workspace', str(target_space_num), '--window-id', str(window_id)],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            return True, "Перемещено через AeroSpace"
+        else:
+            print(f"AeroSpace error: {result.stderr}")
+    except FileNotFoundError:
+        pass  # AeroSpace не установлен
+    except Exception as e:
+        print(f"AeroSpace error: {e}")
+
+    # Метод 2: yabai
+    try:
         result = subprocess.run(
             ['yabai', '-m', 'window', str(window_id), '--space', str(target_space_num)],
             capture_output=True, text=True, timeout=2
@@ -158,38 +166,33 @@ def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
     except Exception as e:
         print(f"yabai error: {e}")
 
-    # Метод 2: Попробуем через SkyLight API
-    try:
-        from Foundation import NSNumber
+    # Метод 3: SkyLight API (fallback)
+    if _init_skylight():
+        space_ids = get_space_ids_map()
+        target_space_id = space_ids.get(target_space_num)
 
-        # Создаём NSArray с window ID
-        wid_num = objc.lookUpClass('NSNumber').numberWithUnsignedInt_(window_id)
-        ns_array = objc.lookUpClass('NSArray').arrayWithObject_(wid_num)
+        if target_space_id:
+            try:
+                wid_num = objc.lookUpClass('NSNumber').numberWithUnsignedInt_(window_id)
+                ns_array = objc.lookUpClass('NSArray').arrayWithObject_(wid_num)
 
-        # Попробуем SLSMoveWindowsToManagedSpace
-        SLSMoveWindowsToManagedSpace = _skylight.SLSMoveWindowsToManagedSpace
-        SLSMoveWindowsToManagedSpace.argtypes = [c_uint32, c_void_p, c_uint64]
-        SLSMoveWindowsToManagedSpace.restype = c_int
+                SLSMoveWindowsToManagedSpace = _skylight.SLSMoveWindowsToManagedSpace
+                SLSMoveWindowsToManagedSpace.argtypes = [c_uint32, c_void_p, c_uint64]
+                SLSMoveWindowsToManagedSpace.restype = c_int
 
-        result = SLSMoveWindowsToManagedSpace(
-            _sls_connection,
-            objc.pyobjc_id(ns_array),
-            target_space_id
-        )
+                result = SLSMoveWindowsToManagedSpace(
+                    _sls_connection,
+                    objc.pyobjc_id(ns_array),
+                    target_space_id
+                )
 
-        if result == 0:
-            return True, "Перемещено через SkyLight"
+                if result == 0:
+                    return True, "Перемещено через SkyLight"
 
-        print(f"SLSMoveWindowsToManagedSpace result: {result}")
+            except Exception as e:
+                print(f"SkyLight move error: {e}")
 
-    except Exception as e:
-        print(f"SkyLight move error: {e}")
-
-    # Метод 3: Попробуем через AppleScript (ограниченно)
-    # AppleScript не может напрямую перемещать окна между Spaces,
-    # но можем предложить пользователю сделать это вручную
-
-    return False, "Перемещение недоступно. Установите yabai для полной поддержки."
+    return False, "Установите AeroSpace: brew install --cask nikitabobko/tap/aerospace"
 
 
 def _get_running_apps_map():
