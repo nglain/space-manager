@@ -41,71 +41,73 @@ CONFIG_PATH = Path.home() / "Клэр" / "apps" / "space-manager" / "config.json
 
 # Кэш иконок приложений
 _app_icon_cache = {}
+_running_apps_cache = {}  # Кэш запущенных приложений
+
+
+def _get_running_apps_map():
+    """Получить словарь запущенных приложений: имя -> NSRunningApplication"""
+    global _running_apps_cache
+    workspace = NSWorkspace.sharedWorkspace()
+    apps = workspace.runningApplications()
+    result = {}
+    for app in apps or []:
+        name = app.localizedName()
+        if name:
+            result[name.lower()] = app
+    return result
 
 
 def get_app_icon(app_name: str, target_size: int = 16) -> QPixmap:
-    """Получить иконку приложения - несколько методов поиска"""
+    """Получить иконку приложения"""
     cache_key = f"{app_name}_{target_size}"
     if cache_key in _app_icon_cache:
         return _app_icon_cache[cache_key]
 
     icon = None
     workspace = NSWorkspace.sharedWorkspace()
+    app_name_lower = app_name.lower()
 
     try:
-        # Метод 1: Поиск среди запущенных приложений
-        running_apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(None)
-        if running_apps is None:
-            running_apps = workspace.runningApplications()
+        # Метод 1: Поиск среди запущенных по точному имени
+        running = _get_running_apps_map()
+        if app_name_lower in running:
+            icon = running[app_name_lower].icon()
 
-        for app in running_apps or []:
-            if app.localizedName() == app_name:
-                icon = app.icon()
-                break
+        # Метод 2: Поиск по частичному совпадению
+        if not icon:
+            for name, app in running.items():
+                if app_name_lower in name or name in app_name_lower:
+                    icon = app.icon()
+                    break
 
-        # Метод 2: Поиск по имени приложения
+        # Метод 3: Через fullPathForApplication
         if not icon:
             app_path = workspace.fullPathForApplication_(app_name)
-            if app_path:
-                icon = workspace.iconForFile_(app_path)
-
-        # Метод 3: Поиск с .app суффиксом
-        if not icon:
-            app_path = workspace.fullPathForApplication_(f"{app_name}.app")
             if app_path:
                 icon = workspace.iconForFile_(app_path)
 
     except Exception:
         pass
 
-    # Конвертировать NSImage в QPixmap
+    # Конвертировать NSImage в QPixmap через TIFF->PNG
     pixmap = QPixmap(target_size, target_size)
     pixmap.fill(Qt.GlobalColor.transparent)
 
     if icon:
         try:
-            # Рендерим в большем размере для качества, потом масштабируем
-            render_size = 64
-            icon.setSize_((render_size, render_size))
-
-            icon.lockFocus()
-            bitmap = NSBitmapImageRep.alloc().initWithFocusedViewRect_(
-                ((0, 0), (render_size, render_size))
-            )
-            icon.unlockFocus()
-
-            if bitmap:
-                png_data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
-                if png_data:
-                    temp_pixmap = QPixmap()
-                    temp_pixmap.loadFromData(bytes(png_data))
-                    if not temp_pixmap.isNull():
-                        # Масштабируем с высоким качеством
-                        pixmap = temp_pixmap.scaled(
-                            target_size, target_size,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
+            tiff_data = icon.TIFFRepresentation()
+            if tiff_data:
+                bitmap = NSBitmapImageRep.imageRepWithData_(tiff_data)
+                if bitmap:
+                    png_data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
+                    if png_data:
+                        temp_pixmap = QPixmap()
+                        if temp_pixmap.loadFromData(bytes(png_data)):
+                            pixmap = temp_pixmap.scaled(
+                                target_size, target_size,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation
+                            )
         except Exception:
             pass
 
@@ -149,34 +151,36 @@ class DragHeader(QFrame):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
 
-def get_windows_on_current_space():
-    """Получить ПОЛНЫЙ список окон на ТЕКУЩЕМ Space с заголовками"""
+def get_windows_on_current_space(include_minimized: bool = False):
+    """Получить список окон на ТЕКУЩЕМ Space (опционально со свёрнутыми)"""
     try:
-        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+        from Quartz import kCGWindowListOptionAll
+
+        if include_minimized:
+            options = kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements
+        else:
+            options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+
         windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
 
         skip_apps = {'Window Server', 'Dock', 'Control Center', 'Spotlight',
                      'SystemUIServer', 'NotificationCenter', 'CursorUIViewService',
-                     'Notification Center', 'com.apple.WebKit', 'universalAccessAuthWarn'}
+                     'Notification Center', 'com.apple.WebKit', 'universalAccessAuthWarn',
+                     'TextInputMenuAgent', 'Пункт управления'}
 
         result = []
         for w in windows:
             owner = w.get('kCGWindowOwnerName', '')
             layer = w.get('kCGWindowLayer', 0)
             title = w.get('kCGWindowName', '')
+            on_screen = w.get('kCGWindowIsOnscreen', True)
 
             # Только обычные окна (layer=0), пропускаем системные
-            if layer == 0 and owner and owner not in skip_apps:
-                # Формируем красивое название
-                if title:
-                    display = f"{owner}: {title[:25]}"
-                else:
-                    display = owner
-
+            if layer == 0 and owner and owner not in skip_apps and title:
                 result.append({
                     "app": owner,
-                    "title": title or "(без названия)",
-                    "display": display[:40]
+                    "title": title,
+                    "minimized": not on_screen
                 })
 
         return result
@@ -221,7 +225,7 @@ def get_spaces_count():
 
 
 def get_optimal_grid(total_spaces: int) -> tuple:
-    """Подобрать оптимальный размер сетки для количества Spaces"""
+    """Подобрать оптимальный размер сетки (максимум 4x4)"""
     if total_spaces <= 2:
         return (1, 2)
     elif total_spaces <= 4:
@@ -232,10 +236,8 @@ def get_optimal_grid(total_spaces: int) -> tuple:
         return (3, 3)
     elif total_spaces <= 12:
         return (3, 4)
-    elif total_spaces <= 16:
-        return (4, 4)
     else:
-        return (5, 5)
+        return (4, 4)  # Максимум 4x4
 
 
 def get_frontmost_app():
@@ -270,57 +272,132 @@ def get_space_count():
 
 
 class AppItemWidget(QWidget):
-    """Компактный виджет приложения с иконкой и tooltip для окон"""
+    """Компактный виджет приложения с иконкой и QMenu при клике"""
 
     def __init__(self, app_name: str, windows: list, is_active_space: bool = False):
         super().__init__()
         self.app_name = app_name
         self.windows = windows
         self.is_active = is_active_space
-        self.setFixedHeight(22)
+        self.setFixedHeight(20)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
 
         # Иконка
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(16, 16)
-        self.icon_label.setScaledContents(False)
-        pixmap = get_app_icon(app_name, 16)
-        if not pixmap.isNull():
-            self.icon_label.setPixmap(pixmap)
+        self.icon_label.setFixedSize(14, 14)
+        self.icon_pixmap = get_app_icon(app_name, 14)
+        if not self.icon_pixmap.isNull():
+            self.icon_label.setPixmap(self.icon_pixmap)
         else:
-            # Fallback - цветной кружок
             self.icon_label.setText("●")
             color = '#fff' if is_active_space else '#888'
-            self.icon_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+            self.icon_label.setStyleSheet(f"color: {color}; font-size: 10px;")
             self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.icon_label)
 
         # Название + количество
-        text = app_name[:14]
+        text = app_name[:12]
         if len(windows) > 1:
             text += f" ({len(windows)})"
         self.name_label = QLabel(text)
-        self.name_label.setFont(QFont(".AppleSystemUIFont", 10))
+        self.name_label.setFont(QFont(".AppleSystemUIFont", 9))
         text_color = '#fff' if is_active_space else '#c5c5c7'
         self.name_label.setStyleSheet(f"color: {text_color}; background: transparent;")
         layout.addWidget(self.name_label)
 
         layout.addStretch()
 
-        # Tooltip с полным списком окон
-        if windows:
-            tooltip_lines = [f"<b>{app_name}</b>"]
-            for w in windows[:10]:  # Макс 10 окон в tooltip
+        # Курсор pointer если есть несколько окон
+        if len(windows) > 1:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        """Клик → QMenu с окнами"""
+        if event.button() == Qt.MouseButton.LeftButton and len(self.windows) > 1:
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu {
+                    background-color: rgba(40, 40, 42, 0.95);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 8px;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    color: #ffffff;
+                    padding: 5px 15px 5px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                }
+                QMenu::item:selected {
+                    background-color: rgba(10, 132, 255, 0.8);
+                }
+                QMenu::item:disabled {
+                    color: #888;
+                }
+            """)
+
+            # Окна
+            for w in self.windows[:12]:
                 title = w.get("title", "") if isinstance(w, dict) else str(w)
+                minimized = w.get("minimized", False) if isinstance(w, dict) else False
                 if title:
-                    title = title[:50] + "..." if len(title) > 50 else title
-                    tooltip_lines.append(f"• {title}")
-            if len(windows) > 10:
-                tooltip_lines.append(f"<i>...и ещё {len(windows) - 10}</i>")
-            self.setToolTip("<br>".join(tooltip_lines))
+                    title = title[:42] + "..." if len(title) > 42 else title
+                    # Свёрнутые помечаем иконкой
+                    prefix = "📥 " if minimized else ""
+                    action = QAction(f"{prefix}{title}", menu)
+                    if minimized:
+                        action.setEnabled(False)  # Серый цвет для свёрнутых
+                    menu.addAction(action)
+
+            if len(self.windows) > 12:
+                menu.addSeparator()
+                more = QAction(f"...ещё {len(self.windows) - 12}", menu)
+                more.setEnabled(False)
+                menu.addAction(more)
+
+            menu.exec(event.globalPosition().toPoint())
+        else:
+            super().mousePressEvent(event)
+
+
+class WindowItemWidget(QWidget):
+    """Виджет отдельного окна (для развёрнутого отображения)"""
+
+    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False):
+        super().__init__()
+        self.setFixedHeight(18)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 0, 0, 0)  # Отступ слева
+        layout.setSpacing(4)
+
+        # Маркер (свёрнутые - специальная иконка)
+        if minimized:
+            bullet = QLabel("📥")
+            bullet.setFont(QFont(".AppleSystemUIFont", 8))
+        else:
+            bullet = QLabel("›")
+            bullet.setFont(QFont(".AppleSystemUIFont", 10))
+        bullet.setFixedWidth(14)
+        color = '#666' if minimized else ('#aaa' if is_active_space else '#777')
+        bullet.setStyleSheet(f"color: {color}; background: transparent;")
+        layout.addWidget(bullet)
+
+        # Название окна (свёрнутые - серым)
+        title_short = title[:22] + "..." if len(title) > 22 else title
+        title_label = QLabel(title_short)
+        title_label.setFont(QFont(".AppleSystemUIFont", 9))
+        if minimized:
+            text_color = '#666'
+        else:
+            text_color = '#ddd' if is_active_space else '#aaa'
+        title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
+        layout.addWidget(title_label)
+
+        layout.addStretch()
 
 
 class SpaceCard(QFrame):
@@ -335,7 +412,7 @@ class SpaceCard(QFrame):
         self.exists = exists
         self._glow_animation = None
 
-        self.setFixedSize(200, 145)
+        self.setFixedSize(230, 175)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.init_ui()
@@ -433,8 +510,11 @@ class SpaceCard(QFrame):
         self.space_name = name
         self.name_label.setText(name or f"Desktop {self.space_num}")
 
+    # Приложения которые всегда показываем развёрнуто
+    EXPANDED_APPS = {'Terminal', 'Терминал', 'iTerm2', 'iTerm', 'Warp', 'Alacritty', 'Hyper'}
+
     def set_apps(self, windows: list):
-        """Установить список окон с иконками (tooltip для деталей)"""
+        """Установить список окон: Terminal развёрнуто, остальные свёрнуто"""
         self.apps = windows
 
         # Очистить старые виджеты
@@ -453,10 +533,37 @@ class SpaceCard(QFrame):
         # Группировать по приложениям
         groups = group_windows_by_app(windows)
 
-        # Показать до 4 приложений (наведи для списка окон)
-        for app_name, app_windows in list(groups.items())[:4]:
-            widget = AppItemWidget(app_name, app_windows, self.is_active)
-            self.apps_layout.addWidget(widget)
+        items_shown = 0
+        max_items = 5  # Максимум элементов в карточке
+
+        for app_name, app_windows in groups.items():
+            if items_shown >= max_items:
+                break
+
+            # Проверяем нужно ли развернуть это приложение
+            is_expanded_app = app_name in self.EXPANDED_APPS
+
+            if is_expanded_app:
+                # Показываем иконку приложения
+                app_widget = AppItemWidget(app_name, [], self.is_active)  # Пустой список - без счётчика
+                self.apps_layout.addWidget(app_widget)
+                items_shown += 1
+
+                # Показываем каждое окно отдельно
+                for w in app_windows[:3]:  # Макс 3 окна терминала
+                    if items_shown >= max_items:
+                        break
+                    title = w.get("title", "") if isinstance(w, dict) else str(w)
+                    minimized = w.get("minimized", False) if isinstance(w, dict) else False
+                    if title:
+                        win_widget = WindowItemWidget(title, self.is_active, minimized)
+                        self.apps_layout.addWidget(win_widget)
+                        items_shown += 1
+            else:
+                # Свёрнутое отображение с QMenu
+                widget = AppItemWidget(app_name, app_windows, self.is_active)
+                self.apps_layout.addWidget(widget)
+                items_shown += 1
 
     def mousePressEvent(self, event):
         if not self.exists:
@@ -921,8 +1028,8 @@ class SpaceManager(QMainWindow):
         self.refresh_apps()
 
     def refresh_apps(self):
-        """Обновить список окон (синхронно)"""
-        windows = get_windows_on_current_space()
+        """Обновить список окон включая свёрнутые"""
+        windows = get_windows_on_current_space(include_minimized=True)
         self._update_apps_ui(windows)
 
     def scan_all_spaces(self):
@@ -942,8 +1049,8 @@ class SpaceManager(QMainWindow):
             subprocess.run(["osascript", "-e", script], capture_output=True, timeout=2)
             time.sleep(0.3)  # Подождать переключения
 
-            # Собрать окна
-            windows = get_windows_on_current_space()
+            # Собрать окна (включая свёрнутые)
+            windows = get_windows_on_current_space(include_minimized=True)
             if windows:
                 if "space_windows" not in self.config:
                     self.config["space_windows"] = {}
