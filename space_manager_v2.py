@@ -17,10 +17,11 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QPushButton,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSystemTrayIcon,
-    QMenu, QDialog, QSpinBox, QMessageBox, QFrame, QScrollArea
+    QMenu, QDialog, QSpinBox, QMessageBox, QFrame, QScrollArea,
+    QGraphicsDropShadowEffect, QGraphicsBlurEffect
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QMetaObject, Q_ARG, pyqtSignal, QObject
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase
 from pynput import keyboard
 import Quartz
 from Quartz import (
@@ -179,7 +180,7 @@ def get_space_count():
 
 
 class SpaceCard(QFrame):
-    """Карточка для одного Space с приложениями"""
+    """Карточка для одного Space — Apple style"""
 
     def __init__(self, space_num: int, name: str = "", apps: list = None, is_active: bool = False, exists: bool = True):
         super().__init__()
@@ -187,46 +188,49 @@ class SpaceCard(QFrame):
         self.space_name = name
         self.apps = apps or []
         self.is_active = is_active
-        self.exists = exists  # Существует ли этот Space
+        self.exists = exists
 
-        self.setFixedSize(220, 180)
+        self.setFixedSize(200, 160)
         if exists:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ForbiddenCursor)
         self.init_ui()
         self.update_style()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
 
-        # Заголовок: номер + название
+        # Заголовок: номер + счётчик окон
         header = QHBoxLayout()
+        header.setSpacing(8)
 
         self.num_label = QLabel(str(self.space_num))
-        self.num_label.setFont(QFont("SF Pro Display", 16, QFont.Weight.Bold))
+        self.num_label.setFont(QFont(".AppleSystemUIFont", 20, QFont.Weight.Medium))
         header.addWidget(self.num_label)
 
         header.addStretch()
 
-        # Количество окон
         self.win_count = QLabel("")
-        self.win_count.setFont(QFont("SF Pro Display", 10))
+        self.win_count.setFont(QFont(".AppleSystemUIFont", 11))
         header.addWidget(self.win_count)
 
         layout.addLayout(header)
 
         # Название
         self.name_label = QLabel(self.space_name or f"Desktop {self.space_num}")
-        self.name_label.setFont(QFont("SF Pro Display", 11))
+        self.name_label.setFont(QFont(".AppleSystemUIFont", 12, QFont.Weight.Medium))
         self.name_label.setWordWrap(True)
         layout.addWidget(self.name_label)
 
-        # Приложения (иконки или текст)
+        # Разделитель
+        self.separator = QFrame()
+        self.separator.setFixedHeight(1)
+        layout.addWidget(self.separator)
+
+        # Приложения
         self.apps_label = QLabel("")
-        self.apps_label.setFont(QFont("SF Pro Display", 9))
+        self.apps_label.setFont(QFont(".AppleSystemUIFont", 10))
         self.apps_label.setWordWrap(True)
         layout.addWidget(self.apps_label)
 
@@ -234,46 +238,39 @@ class SpaceCard(QFrame):
 
     def update_style(self):
         if not self.exists:
-            # Несуществующий Space - серый и неактивный
             self.setStyleSheet("""
-                QFrame {
-                    background-color: #1A1A1A;
-                    border: 1px dashed #333333;
+                SpaceCard {
+                    background-color: rgba(30, 30, 30, 0.4);
+                    border: none;
                     border-radius: 12px;
                 }
-                QLabel {
-                    color: #444444;
-                    background: transparent;
-                }
+                QLabel { color: #3a3a3a; background: transparent; }
+                QFrame { background: transparent; }
             """)
+            self.separator.setStyleSheet("background-color: #2a2a2a;")
         elif self.is_active:
             self.setStyleSheet("""
-                QFrame {
-                    background-color: #007AFF;
-                    border: 2px solid #005CBB;
+                SpaceCard {
+                    background-color: rgba(10, 132, 255, 0.85);
+                    border: none;
                     border-radius: 12px;
                 }
-                QLabel {
-                    color: white;
-                    background: transparent;
-                }
+                QLabel { color: #ffffff; background: transparent; }
             """)
+            self.separator.setStyleSheet("background-color: rgba(255,255,255,0.2);")
         else:
             self.setStyleSheet("""
-                QFrame {
-                    background-color: #2D2D2D;
-                    border: 2px solid #444444;
+                SpaceCard {
+                    background-color: rgba(58, 58, 60, 0.6);
+                    border: none;
                     border-radius: 12px;
                 }
-                QFrame:hover {
-                    background-color: #3D3D3D;
-                    border-color: #007AFF;
+                SpaceCard:hover {
+                    background-color: rgba(72, 72, 74, 0.8);
                 }
-                QLabel {
-                    color: #CCCCCC;
-                    background: transparent;
-                }
+                QLabel { color: #e5e5e7; background: transparent; }
             """)
+            self.separator.setStyleSheet("background-color: rgba(255,255,255,0.08);")
 
     def set_active(self, active: bool):
         self.is_active = active
@@ -287,20 +284,18 @@ class SpaceCard(QFrame):
         """Установить список окон для отображения"""
         self.apps = windows
         if windows:
-            # Показать каждое окно с новой строки (до 5)
             lines = []
-            for w in windows[:5]:
+            for w in windows[:4]:  # До 4 окон
                 if isinstance(w, dict):
-                    # Новый формат с полным заголовком
                     display = w.get("display", w.get("name", "?"))
-                    lines.append(f"▸ {display[:28]}")
+                    lines.append(display[:30])
                 else:
-                    lines.append(f"▸ {str(w)[:28]}")
+                    lines.append(str(w)[:30])
 
             self.apps_label.setText("\n".join(lines))
-            self.win_count.setText(f"🪟 {len(windows)}")
+            self.win_count.setText(str(len(windows)))
         else:
-            self.apps_label.setText("📭 пусто")
+            self.apps_label.setText("Empty")
             self.win_count.setText("")
 
     def mousePressEvent(self, event):
@@ -319,30 +314,46 @@ class SpaceCard(QFrame):
 
 
 class SettingsDialog(QDialog):
-    """Диалог настроек"""
+    """Диалог настроек — Apple style"""
 
     def __init__(self, parent, rows: int, cols: int, total_spaces: int):
         super().__init__(parent)
-        self.setWindowTitle("Настройки Space Manager")
+        self.setWindowTitle("Settings")
         self.setModal(True)
         self.setStyleSheet("""
-            QDialog { background-color: #1E1E1E; }
-            QLabel { color: white; }
+            QDialog {
+                background-color: rgba(30, 30, 30, 0.95);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #e5e5e7;
+                font-family: ".AppleSystemUIFont";
+                font-size: 13px;
+            }
             QSpinBox {
-                background-color: #2D2D2D;
-                color: white;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 4px;
+                background-color: rgba(118, 118, 128, 0.24);
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-family: ".AppleSystemUIFont";
+                font-size: 13px;
             }
             QPushButton {
-                background-color: #444444;
-                color: white;
+                background-color: rgba(118, 118, 128, 0.24);
+                color: #ffffff;
                 border: none;
                 border-radius: 6px;
                 padding: 8px 16px;
+                font-family: ".AppleSystemUIFont";
+                font-size: 13px;
             }
-            QPushButton:hover { background-color: #555555; }
+            QPushButton:hover {
+                background-color: rgba(118, 118, 128, 0.4);
+            }
+            QPushButton:pressed {
+                background-color: rgba(118, 118, 128, 0.5);
+            }
         """)
 
         layout = QVBoxLayout(self)
@@ -398,31 +409,47 @@ class SettingsDialog(QDialog):
 
 
 class RenameDialog(QDialog):
-    """Диалог переименования Space"""
+    """Диалог переименования — Apple style"""
 
     def __init__(self, parent, space_num: int, current_name: str):
         super().__init__(parent)
-        self.setWindowTitle(f"Переименовать Space {space_num}")
+        self.setWindowTitle(f"Rename Desktop {space_num}")
         self.setModal(True)
         self.setStyleSheet("""
-            QDialog { background-color: #1E1E1E; }
-            QLabel { color: white; }
+            QDialog {
+                background-color: rgba(30, 30, 30, 0.95);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #e5e5e7;
+                font-family: ".AppleSystemUIFont";
+                font-size: 13px;
+            }
             QLineEdit {
-                background-color: #2D2D2D;
-                color: white;
-                border: 1px solid #444;
-                border-radius: 6px;
-                padding: 8px;
+                background-color: rgba(118, 118, 128, 0.24);
+                color: #ffffff;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 12px;
+                font-family: ".AppleSystemUIFont";
                 font-size: 14px;
+                selection-background-color: rgba(10, 132, 255, 0.5);
+            }
+            QLineEdit:focus {
+                background-color: rgba(118, 118, 128, 0.32);
             }
             QPushButton {
-                background-color: #444444;
-                color: white;
+                background-color: rgba(118, 118, 128, 0.24);
+                color: #ffffff;
                 border: none;
                 border-radius: 6px;
                 padding: 8px 16px;
+                font-family: ".AppleSystemUIFont";
+                font-size: 13px;
             }
-            QPushButton:hover { background-color: #555555; }
+            QPushButton:hover {
+                background-color: rgba(118, 118, 128, 0.4);
+            }
         """)
 
         layout = QVBoxLayout(self)
@@ -515,57 +542,59 @@ class SpaceManager(QMainWindow):
             json.dump(self.config, f, indent=2, ensure_ascii=False)
 
     def init_ui(self):
-        # Главный контейнер с закруглёнными углами
+        # Главный контейнер — Apple vibrancy style
         container = QFrame()
         container.setStyleSheet("""
-            QFrame {
-                background-color: #1E1E1E;
-                border-radius: 16px;
-                border: 1px solid #333333;
+            QFrame#mainContainer {
+                background-color: rgba(28, 28, 30, 0.92);
+                border-radius: 14px;
+                border: 0.5px solid rgba(255, 255, 255, 0.1);
             }
         """)
+        container.setObjectName("mainContainer")
         self.setCentralWidget(container)
 
-        main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        # Тень для окна
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(40)
+        shadow.setXOffset(0)
+        shadow.setYOffset(10)
+        shadow.setColor(QColor(0, 0, 0, 120))
+        container.setGraphicsEffect(shadow)
 
-        # Заголовок с drag area (перетаскивание за заголовок)
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(16, 12, 16, 16)
+        main_layout.setSpacing(12)
+
+        # Заголовок с drag area
         drag_header = DragHeader(self)
         header_layout = QHBoxLayout(drag_header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setContentsMargins(4, 0, 0, 0)
 
-        title = QLabel("🖥️ Space Manager")
-        title.setFont(QFont("SF Pro Display", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: white; background: transparent;")
+        title = QLabel("Spaces")
+        title.setFont(QFont(".AppleSystemUIFont", 15, QFont.Weight.DemiBold))
+        title.setStyleSheet("color: #ffffff; background: transparent;")
         header_layout.addWidget(title)
 
         header_layout.addStretch()
 
-        # Кнопка закрытия
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(24, 24)
+        # Кнопка закрытия — macOS style
+        close_btn = QPushButton()
+        close_btn.setFixedSize(12, 12)
         close_btn.setStyleSheet("""
             QPushButton {
-                background-color: #FF5F57;
-                color: white;
+                background-color: #ff5f57;
                 border: none;
-                border-radius: 12px;
-                font-size: 16px;
-                font-weight: bold;
+                border-radius: 6px;
             }
-            QPushButton:hover { background-color: #FF3B30; }
+            QPushButton:hover {
+                background-color: #ff3b30;
+            }
         """)
         close_btn.clicked.connect(self.hide)
         header_layout.addWidget(close_btn)
 
         main_layout.addWidget(drag_header)
-
-        # Подсказка
-        hint = QLabel("Клик = переключить  •  Двойной клик = переименовать  •  Esc = скрыть")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color: #666666; font-size: 10px; background: transparent;")
-        main_layout.addWidget(hint)
 
         # Grid с карточками Spaces
         self.grid_widget = QWidget()
@@ -576,46 +605,44 @@ class SpaceManager(QMainWindow):
 
         self.rebuild_grid()
 
-        # Кнопки управления
+        # Кнопки управления — минималистичные
         controls = QHBoxLayout()
+        controls.setSpacing(8)
 
         btn_style = """
             QPushButton {
-                background-color: #333333;
-                color: white;
+                background-color: rgba(118, 118, 128, 0.2);
+                color: #e5e5e7;
                 border: none;
-                border-radius: 8px;
-                padding: 8px 12px;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-family: ".AppleSystemUIFont";
+                font-size: 12px;
             }
-            QPushButton:hover { background-color: #444444; }
+            QPushButton:hover {
+                background-color: rgba(118, 118, 128, 0.35);
+            }
+            QPushButton:pressed {
+                background-color: rgba(118, 118, 128, 0.45);
+            }
         """
 
-        refresh_btn = QPushButton("🔄 Обновить")
+        refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_apps)
         refresh_btn.setStyleSheet(btn_style)
         controls.addWidget(refresh_btn)
 
-        scan_btn = QPushButton("🔍 Сканировать все")
+        scan_btn = QPushButton("Scan All")
         scan_btn.clicked.connect(self.scan_all_spaces)
         scan_btn.setStyleSheet(btn_style)
-        scan_btn.setToolTip("Пройтись по всем Spaces и собрать окна (будет мигать)")
         controls.addWidget(scan_btn)
 
-        settings_btn = QPushButton("⚙️ Настройки")
-        settings_btn.clicked.connect(self.show_settings)
-        settings_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #333333;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 12px;
-            }
-            QPushButton:hover { background-color: #444444; }
-        """)
-        controls.addWidget(settings_btn)
-
         controls.addStretch()
+
+        settings_btn = QPushButton("Settings")
+        settings_btn.clicked.connect(self.show_settings)
+        settings_btn.setStyleSheet(btn_style)
+        controls.addWidget(settings_btn)
 
         main_layout.addLayout(controls)
 
