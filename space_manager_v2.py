@@ -125,30 +125,51 @@ def get_window_id_by_title(app_name: str, window_title: str) -> int:
     return 0
 
 
-def move_window_to_space(window_id: int, target_space_num: int) -> bool:
-    """Переместить окно на указанный Space через SkyLight API"""
+def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
+    """
+    Переместить окно на указанный Space через SkyLight API.
+
+    Returns: (success: bool, message: str)
+
+    Примечание: На современных версиях macOS эта функция может не работать
+    из-за ограничений безопасности. Для полноценной работы рекомендуется
+    установить yabai (https://github.com/koekeishiya/yabai).
+    """
     if not _init_skylight():
-        print("SkyLight not initialized")
-        return False
+        return False, "SkyLight framework недоступен"
 
     space_ids = get_space_ids_map()
     target_space_id = space_ids.get(target_space_num)
 
     if not target_space_id:
-        print(f"Space {target_space_num} not found in space_ids: {space_ids}")
-        return False
+        return False, f"Space {target_space_num} не найден"
 
+    # Метод 1: Попробуем через yabai если установлен
     try:
-        # Метод 1: SLSMoveWindowsToManagedSpace
+        import subprocess
+        result = subprocess.run(
+            ['yabai', '-m', 'window', str(window_id), '--space', str(target_space_num)],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            return True, "Перемещено через yabai"
+    except FileNotFoundError:
+        pass  # yabai не установлен
+    except Exception as e:
+        print(f"yabai error: {e}")
+
+    # Метод 2: Попробуем через SkyLight API
+    try:
+        from Foundation import NSNumber
+
+        # Создаём NSArray с window ID
+        wid_num = objc.lookUpClass('NSNumber').numberWithUnsignedInt_(window_id)
+        ns_array = objc.lookUpClass('NSArray').arrayWithObject_(wid_num)
+
+        # Попробуем SLSMoveWindowsToManagedSpace
         SLSMoveWindowsToManagedSpace = _skylight.SLSMoveWindowsToManagedSpace
         SLSMoveWindowsToManagedSpace.argtypes = [c_uint32, c_void_p, c_uint64]
         SLSMoveWindowsToManagedSpace.restype = c_int
-
-        # Создаём CFArray с одним window ID
-        from CoreFoundation import CFArrayCreate, kCFTypeArrayCallBacks
-        window_ids = [window_id]
-        # Используем objc для создания NSArray
-        ns_array = objc.lookUpClass('NSArray').arrayWithObject_(window_id)
 
         result = SLSMoveWindowsToManagedSpace(
             _sls_connection,
@@ -156,20 +177,19 @@ def move_window_to_space(window_id: int, target_space_num: int) -> bool:
             target_space_id
         )
 
+        if result == 0:
+            return True, "Перемещено через SkyLight"
+
         print(f"SLSMoveWindowsToManagedSpace result: {result}")
-        return result == 0
 
     except Exception as e:
-        print(f"move_window_to_space error: {e}")
+        print(f"SkyLight move error: {e}")
 
-        # Fallback: попробуем SLSSpaceAddWindowsAndRemoveFromSpaces
-        try:
-            # Нужно знать текущий Space окна
-            pass
-        except:
-            pass
+    # Метод 3: Попробуем через AppleScript (ограниченно)
+    # AppleScript не может напрямую перемещать окна между Spaces,
+    # но можем предложить пользователю сделать это вручную
 
-        return False
+    return False, "Перемещение недоступно. Установите yabai для полной поддержки."
 
 
 def _get_running_apps_map():
@@ -867,7 +887,7 @@ class SpaceCard(QFrame):
                 print(f"Moving window {window_id} ({app_name}: {window_title}) from Space {source_space} to Space {self.space_num}")
 
                 # Перемещаем окно
-                success = move_window_to_space(window_id, self.space_num)
+                success, message = move_window_to_space(window_id, self.space_num)
 
                 if success:
                     event.acceptProposedAction()
@@ -876,6 +896,15 @@ class SpaceCard(QFrame):
                     if hasattr(main_window, 'refresh_apps'):
                         QTimer.singleShot(500, main_window.refresh_apps)
                     return
+                else:
+                    # Показываем сообщение об ошибке
+                    print(f"Move failed: {message}")
+                    # Можно добавить QToolTip или StatusBar сообщение
+                    main_window = self.window()
+                    if main_window:
+                        # Временно показываем в заголовке
+                        main_window.setWindowTitle(f"⚠️ {message}")
+                        QTimer.singleShot(3000, lambda: main_window.setWindowTitle("Space Manager"))
 
             event.ignore()
 
