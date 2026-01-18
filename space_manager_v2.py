@@ -683,7 +683,7 @@ class SpaceManager(QMainWindow):
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setToolTip("Space Manager - Ctrl+Opt+Space для открытия")
+        self.tray_icon.setToolTip("Space Manager - Ctrl+Tab для открытия")
 
         tray_menu = QMenu()
 
@@ -868,15 +868,14 @@ def main():
     hotkey_signal = HotkeySignal()
     hotkey_signal.toggle.connect(window.show_and_raise)
 
-    # Глобальный hotkey: Ctrl+Option+Space
+    # Глобальный hotkey: Ctrl+Tab
     current_keys = set()
 
     def on_press(key):
         current_keys.add(key)
-        # Ctrl + Option + Space
+        # Ctrl + Tab
         if (keyboard.Key.ctrl in current_keys and
-            keyboard.Key.alt in current_keys and
-            keyboard.Key.space in current_keys):
+            keyboard.Key.tab in current_keys):
             hotkey_signal.toggle.emit()
 
     def on_release(key):
@@ -888,7 +887,7 @@ def main():
     listener.start()
 
     print("Space Manager запущен!")
-    print("Hotkey: Ctrl+Option+Space")
+    print("Hotkey: Ctrl+Tab")
 
     sys.exit(app.exec())
 
