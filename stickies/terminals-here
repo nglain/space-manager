@@ -1,0 +1,78 @@
+#!/bin/bash
+# Показать терминалы ТОЛЬКО на текущем desktop в Stickies
+
+LOG="/tmp/terminals-here.log"
+echo "=== $(date) ===" > "$LOG"
+
+# Python с модулем Quartz (anaconda)
+PYTHON="/opt/anaconda3/bin/python3"
+
+echo "Python: $PYTHON" >> "$LOG"
+
+# Получаем окна текущего desktop через Quartz API
+TERMINALS=$("$PYTHON" - << 'PYEOF' 2>> "$LOG"
+import Quartz
+
+windows = Quartz.CGWindowListCopyWindowInfo(
+    Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+    Quartz.kCGNullWindowID
+)
+
+terminals = []
+for w in windows:
+    owner = w.get('kCGWindowOwnerName', '')
+    name = w.get('kCGWindowName', '')
+    if owner in ('Terminal', 'Терминал') and name:
+        if len(name) > 55:
+            name = name[:55] + "..."
+        terminals.append(name)
+
+output = f"🖥 ТЕРМИНАЛЫ ({len(terminals)}):\n\n"
+for i, name in enumerate(terminals, 1):
+    output += f"{i}. {name}\n"
+
+if not terminals:
+    output += "(нет окон терминала)"
+
+print(output)
+PYEOF
+)
+
+echo "Terminals found: ${#TERMINALS}" >> "$LOG"
+echo "$TERMINALS" >> "$LOG"
+
+# Копируем в буфер
+echo "$TERMINALS" | /usr/bin/pbcopy
+
+# Проверяем буфер
+echo "Clipboard: $(/usr/bin/pbpaste | head -1)" >> "$LOG"
+
+# Ждём
+sleep 0.3
+
+# Открываем Stickies и вставляем
+/usr/bin/osascript << 'EOF' 2>> "$LOG"
+tell application "Stickies" to quit
+delay 0.8
+
+tell application "Stickies" to activate
+delay 1
+
+tell application "System Events"
+    tell process "Stickies"
+        set frontmost to true
+        delay 0.3
+
+        -- Проверяем есть ли уже окно
+        if (count of windows) = 0 then
+            click menu item "Новая записка" of menu "Файл" of menu bar 1
+            delay 0.5
+        end if
+
+        -- Вставляем
+        click menu item "Вставить" of menu "Правка" of menu bar 1
+    end tell
+end tell
+EOF
+
+echo "Done" >> "$LOG"

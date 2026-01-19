@@ -1,0 +1,45 @@
+#!/bin/bash
+# Показать список окон терминала в Stickies
+
+# Собираем список терминалов
+osascript -e '
+tell application "Terminal"
+    set windowList to "🖥 ТЕРМИНАЛЫ:" & return & return
+    set idx to 1
+    repeat with w in (every window)
+        try
+            set winName to name of w
+            if length of winName > 50 then
+                set winName to text 1 thru 50 of winName & "..."
+            end if
+            set windowList to windowList & idx & ". " & winName & return
+            set idx to idx + 1
+            if idx > 30 then exit repeat
+        end try
+    end repeat
+    if idx > 30 then set windowList to windowList & "... и ещё " & ((count of windows) - 30) & " окон"
+    return windowList
+end tell
+' | pbcopy
+
+# Открываем Stickies и вставляем через меню
+osascript <<'EOF'
+tell application "Stickies" to quit
+delay 0.5
+tell application "Stickies" to activate
+delay 0.5
+
+tell application "System Events"
+    tell process "Stickies"
+        set frontmost to true
+        delay 0.3
+        -- Новая записка
+        click menu item "Новая заметка" of menu "Файл" of menu bar 1
+        delay 0.3
+        -- Вставить через меню (не зависит от раскладки)
+        click menu item "Вставить" of menu "Правка" of menu bar 1
+    end tell
+end tell
+EOF
+
+echo "✅ Список терминалов в Stickies"

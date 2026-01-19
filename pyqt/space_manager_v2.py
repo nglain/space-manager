@@ -108,113 +108,133 @@ def get_space_ids_map():
         return {}
 
 
-# Кэш AeroSpace окон (обновляется при refresh_apps)
-_aerospace_windows_cache = {}
-_aerospace_cache_time = 0
-_focused_workspace_cache = 1  # Кэш текущего активного workspace
+# ============================================================================
+# HAMMERSPOON BACKEND (заменяет AeroSpace)
+# ============================================================================
+# Кэш окон (обновляется при refresh_apps)
+_windows_cache = {}
+_windows_cache_time = 0
+_focused_space_cache = 1  # Кэш текущего активного space (1-based index)
+_spaces_count_cache = 16  # Количество spaces
 
-def get_aerospace_windows_sync():
-    """Синхронное получение окон AeroSpace (вызывать ДО Qt или из pre-cache)"""
+def _hs_call(lua_code: str, timeout: float = 2.0) -> str:
+    """Вызвать Hammerspoon CLI и получить результат"""
     try:
         result = subprocess.run(
-            ['/opt/homebrew/bin/aerospace', 'list-windows', '--all',
-             '--format', '%{window-id}|%{app-name}|%{window-title}|%{workspace}'],
-            capture_output=True, text=True, timeout=5,
+            ['hs', '-c', lua_code],
+            capture_output=True, text=True, timeout=timeout,
             stdin=subprocess.DEVNULL
         )
         if result.returncode == 0:
-            return result.stdout
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("[HS] Hammerspoon CLI (hs) not found. Install: brew install hammerspoon", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[HS] Timeout calling: {lua_code[:50]}...", flush=True)
     except Exception as e:
-        print(f"[AEROSPACE] Sync error: {e}", flush=True)
-    return None
+        print(f"[HS] Error: {e}", flush=True)
+    return ""
 
+def get_hammerspoon_windows_sync() -> list:
+    """Синхронное получение окон через Hammerspoon (вызывать ДО Qt)"""
+    try:
+        output = _hs_call('return lw()', timeout=3.0)
+        if output:
+            return json.loads(output)
+    except json.JSONDecodeError as e:
+        print(f"[HS] JSON decode error: {e}", flush=True)
+    except Exception as e:
+        print(f"[HS] get_windows error: {e}", flush=True)
+    return []
 
 def get_focused_workspace() -> int:
-    """Получить текущий активный workspace из кэша (обновляется в pre-cache)"""
-    global _focused_workspace_cache
-    return _focused_workspace_cache
+    """Получить текущий активный space из кэша (1-based index)"""
+    global _focused_space_cache
+    return _focused_space_cache
+
+def get_focused_workspace_sync() -> int:
+    """Получить текущий активный space напрямую от Hammerspoon"""
+    try:
+        output = _hs_call('return fs()', timeout=1.0)
+        if output and output.isdigit():
+            return int(output)
+    except Exception as e:
+        print(f"[HS] get_focused error: {e}", flush=True)
+    return 1
 
 
 def update_focused_workspace_sync() -> int:
-    """Синхронное обновление активного workspace (вызывать ДО Qt!)"""
-    global _focused_workspace_cache
+    """Синхронное обновление активного space (вызывать ДО Qt!)"""
+    global _focused_space_cache, _spaces_count_cache
     try:
-        result = subprocess.run(
-            ['/opt/homebrew/bin/aerospace', 'list-workspaces', '--focused'],
-            capture_output=True, text=True, timeout=2,
-            stdin=subprocess.DEVNULL
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            ws = result.stdout.strip()
-            if ws.isdigit():
-                _focused_workspace_cache = int(ws)
-                print(f"[PRE-CACHE] Focused workspace: {_focused_workspace_cache}", flush=True)
-                return _focused_workspace_cache
+        output = _hs_call('return ls()', timeout=2.0)
+        if output:
+            data = json.loads(output)
+            _focused_space_cache = data.get('focusedIndex', 1)
+            _spaces_count_cache = data.get('count', 16)
+            print(f"[PRE-CACHE] Focused space: {_focused_space_cache}, total: {_spaces_count_cache}", flush=True)
+            return _focused_space_cache
     except Exception as e:
-        print(f"[AEROSPACE] update_focused_workspace error: {e}", flush=True)
-    return _focused_workspace_cache
+        print(f"[HS] update_focused_workspace error: {e}", flush=True)
+    return _focused_space_cache
 
 
-def refresh_aerospace_cache():
-    """Обновить кэш окон AeroSpace"""
-    global _aerospace_windows_cache, _aerospace_cache_time
+def refresh_windows_cache():
+    """Обновить кэш окон через Hammerspoon"""
+    global _windows_cache, _windows_cache_time
     import time
-    import os
 
     try:
         # Используем pre-cached данные если свежие (< 3 сек)
-        if _aerospace_cache_time and (time.time() - _aerospace_cache_time) < 3:
-            print(f"[CACHE] Using cached data ({len(_aerospace_windows_cache)} windows)", flush=True)
+        if _windows_cache_time and (time.time() - _windows_cache_time) < 3:
+            print(f"[CACHE] Using cached data ({len(_windows_cache)} windows)", flush=True)
             return
 
-        print("[CACHE] Refreshing aerospace windows...", flush=True)
-
-        # Запускаем синхронно через os.system (блокирует, но aerospace быстрый ~0.03 сек)
-        tmp_file = '/tmp/aerospace_windows.txt'
-        os.system(f'/opt/homebrew/bin/aerospace list-windows --all --format "%{{window-id}}|%{{app-name}}|%{{window-title}}|%{{workspace}}" > {tmp_file} 2>/dev/null')
-
-        # Читаем результат сразу (os.system уже подождал)
-        if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
-            with open(tmp_file, 'r') as f:
-                output = f.read()
-            if output:
-                _parse_aerospace_output(output)
-                print(f"[CACHE] Refreshed: {len(_aerospace_windows_cache)} windows", flush=True)
+        print("[CACHE] Refreshing windows via Hammerspoon...", flush=True)
+        windows = get_hammerspoon_windows_sync()
+        _parse_hammerspoon_windows(windows)
+        print(f"[CACHE] Refreshed: {len(_windows_cache)} windows", flush=True)
     except Exception as e:
-        print(f"AeroSpace cache refresh error: {e}", flush=True)
+        print(f"[HS] Cache refresh error: {e}", flush=True)
+
+# Алиас для совместимости
+refresh_aerospace_cache = refresh_windows_cache
 
 
-def _parse_aerospace_output(output):
-    """Парсить вывод aerospace list-windows"""
-    global _aerospace_windows_cache, _aerospace_cache_time
+def _parse_hammerspoon_windows(windows: list):
+    """Парсить список окон от Hammerspoon"""
+    global _windows_cache, _windows_cache_time
     import time
 
-    _aerospace_windows_cache = {}
-    for line in output.strip().split('\n'):
-        if not line.strip():
-            continue
-        parts = line.split('|')
-        if len(parts) >= 4:
-            wid = parts[0].strip()
-            app = parts[1].strip()
-            title = parts[2].strip()
-            workspace = parts[3].strip()
-            # Сохраняем и ID, и workspace
-            key = f"{app}|{title}"
-            _aerospace_windows_cache[key] = {
-                'id': int(wid),
-                'workspace': workspace,
-                'app': app,
-                'title': title
-            }
-    _aerospace_cache_time = time.time()
-    print(f"[CACHE] AeroSpace cache updated: {len(_aerospace_windows_cache)} windows", flush=True)
+    _windows_cache = {}
+    for w in windows:
+        wid = w.get('id')
+        app = w.get('app', 'Unknown')
+        title = w.get('title', '')
+        space_idx = w.get('spaceIndex')  # 1-based index
+
+        key = f"{app}|{title}"
+        _windows_cache[key] = {
+            'id': wid,
+            'workspace': str(space_idx) if space_idx else '?',
+            'app': app,
+            'title': title,
+            'spaceIndex': space_idx,
+            'visible': w.get('visible', True),
+            'minimized': w.get('minimized', False)
+        }
+    _windows_cache_time = time.time()
+    print(f"[CACHE] Hammerspoon cache updated: {len(_windows_cache)} windows", flush=True)
+
+# Алиасы для совместимости
+_aerospace_windows_cache = _windows_cache
+_aerospace_cache_time = _windows_cache_time
 
 
 def get_windows_by_workspace():
-    """Получить окна сгруппированные по workspace (из aerospace)"""
+    """Получить окна сгруппированные по space index"""
     result = {}
-    for key, data in _aerospace_windows_cache.items():
+    for key, data in _windows_cache.items():
         ws = data['workspace']
         if ws not in result:
             result[ws] = []
@@ -227,23 +247,20 @@ def get_windows_by_workspace():
 
 
 def get_window_id_by_title(app_name: str, window_title: str) -> int:
-    """Найти Window ID по имени приложения и заголовку окна.
-
-    Использует кэш AeroSpace (новый формат с dict).
-    """
-    if not _aerospace_windows_cache:
+    """Найти Window ID по имени приложения и заголовку окна."""
+    if not _windows_cache:
         print(f"[GET_ID] Cache empty!", flush=True)
         return 0
 
     # Точное совпадение
     key = f"{app_name}|{window_title}"
-    if key in _aerospace_windows_cache:
-        wid = _aerospace_windows_cache[key]['id']
+    if key in _windows_cache:
+        wid = _windows_cache[key]['id']
         print(f"[GET_ID] Exact match: {app_name} -> {wid}", flush=True)
         return wid
 
     # Частичное совпадение (title может быть обрезан)
-    for cached_key, data in _aerospace_windows_cache.items():
+    for cached_key, data in _windows_cache.items():
         cached_app = data['app']
         cached_title = data['title']
         if cached_app == app_name:
@@ -260,82 +277,47 @@ def get_window_id_by_title(app_name: str, window_title: str) -> int:
 
 
 def update_window_workspace_in_cache(window_id: int, new_workspace: int):
-    """Обновить workspace окна в кэше (без вызова aerospace)"""
-    global _aerospace_windows_cache
-    for key, data in _aerospace_windows_cache.items():
+    """Обновить workspace окна в кэше"""
+    global _windows_cache
+    for key, data in _windows_cache.items():
         if data.get('id') == window_id:
             old_ws = data.get('workspace')
             data['workspace'] = str(new_workspace)
-            print(f"[CACHE] Updated window {window_id} workspace: {old_ws} -> {new_workspace}", flush=True)
+            data['spaceIndex'] = new_workspace
+            print(f"[CACHE] Updated window {window_id} space: {old_ws} -> {new_workspace}", flush=True)
             return True
     return False
 
 
 def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
     """
-    Переместить окно на указанный Space/Workspace.
+    Переместить окно на указанный Space.
 
     Returns: (success: bool, message: str)
 
-    Поддерживаемые методы (в порядке приоритета):
-    1. AeroSpace (рекомендуется, не требует SIP)
-    2. yabai (требует частичного отключения SIP)
-    3. SkyLight API (часто не работает на современных macOS)
+    Использует Hammerspoon + PaperWM Mission Control simulation.
     """
-    global _aerospace_cache_time
-    import os
+    print(f"[MOVE] Moving window {window_id} to space {target_space_num}...", flush=True)
 
-    # Метод 1: AeroSpace - через os.system в background (обход Qt блокировки)
+    # Hammerspoon через Mission Control (основной метод)
     try:
-        cmd = f'/opt/homebrew/bin/aerospace move-node-to-workspace {target_space_num} --window-id {window_id} </dev/null >/dev/null 2>&1 &'
-        print(f"[MOVE] Executing: {cmd}", flush=True)
-        os.system(cmd)
-        # Обновляем кэш вручную (без вызова aerospace)
-        update_window_workspace_in_cache(window_id, target_space_num)
-        return True, "Перемещено через AeroSpace"
+        output = _hs_call(f'return mw({window_id}, {target_space_num})', timeout=10.0)
+        if output:
+            result = json.loads(output)
+            if result.get('success'):
+                update_window_workspace_in_cache(window_id, target_space_num)
+                print(f"[MOVE] Success via Hammerspoon", flush=True)
+                return True, "Перемещено через Hammerspoon"
+            else:
+                error = result.get('error', 'unknown error')
+                print(f"[MOVE] Hammerspoon error: {error}", flush=True)
+                return False, f"Ошибка: {error}"
+    except json.JSONDecodeError as e:
+        print(f"[MOVE] JSON error: {e}", flush=True)
     except Exception as e:
-        print(f"AeroSpace error: {e}")
+        print(f"[MOVE] Hammerspoon error: {e}", flush=True)
 
-    # Метод 2: yabai
-    try:
-        result = subprocess.run(
-            ['yabai', '-m', 'window', str(window_id), '--space', str(target_space_num)],
-            capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            return True, "Перемещено через yabai"
-    except FileNotFoundError:
-        pass  # yabai не установлен
-    except Exception as e:
-        print(f"yabai error: {e}")
-
-    # Метод 3: SkyLight API (fallback)
-    if _init_skylight():
-        space_ids = get_space_ids_map()
-        target_space_id = space_ids.get(target_space_num)
-
-        if target_space_id:
-            try:
-                wid_num = objc.lookUpClass('NSNumber').numberWithUnsignedInt_(window_id)
-                ns_array = objc.lookUpClass('NSArray').arrayWithObject_(wid_num)
-
-                SLSMoveWindowsToManagedSpace = _skylight.SLSMoveWindowsToManagedSpace
-                SLSMoveWindowsToManagedSpace.argtypes = [c_uint32, c_void_p, c_uint64]
-                SLSMoveWindowsToManagedSpace.restype = c_int
-
-                result = SLSMoveWindowsToManagedSpace(
-                    _sls_connection,
-                    objc.pyobjc_id(ns_array),
-                    target_space_id
-                )
-
-                if result == 0:
-                    return True, "Перемещено через SkyLight"
-
-            except Exception as e:
-                print(f"SkyLight move error: {e}")
-
-    return False, "Установите AeroSpace: brew install --cask nikitabobko/tap/aerospace"
+    return False, "Hammerspoon не доступен. Установите: brew install hammerspoon"
 
 
 def _get_running_apps_map():
@@ -1822,11 +1804,11 @@ class SpaceManager(QMainWindow):
             card.set_apps(windows)
 
     def refresh_apps(self):
-        """Обновить список окон используя данные AeroSpace (может блокировать)"""
-        # Обновляем кэш AeroSpace окон (если устарел)
-        refresh_aerospace_cache()
+        """Обновить список окон используя данные Hammerspoon"""
+        # Обновляем кэш окон (если устарел)
+        refresh_windows_cache()
 
-        # Получаем текущий активный workspace из AeroSpace
+        # Получаем текущий активный space
         focused_ws = get_focused_workspace()
         old_active = self.config.get("active_space", 1)
         if focused_ws != old_active:
@@ -2082,34 +2064,30 @@ class DebugEventFilter(QObject):
         return False  # Не перехватываем, просто логируем
 
 
-def precache_aerospace_windows():
-    """Предварительное кэширование окон AeroSpace ДО запуска Qt"""
-    global _aerospace_windows_cache, _aerospace_cache_time
-    import time
+def precache_windows():
+    """Предварительное кэширование окон через Hammerspoon ДО запуска Qt"""
+    global _windows_cache, _windows_cache_time
 
-    print("[PRE-CACHE] Loading aerospace windows before Qt...", flush=True)
+    print("[PRE-CACHE] Loading windows via Hammerspoon before Qt...", flush=True)
     try:
         # Кэшируем список окон
-        result = subprocess.run(
-            ['/opt/homebrew/bin/aerospace', 'list-windows', '--all',
-             '--format', '%{window-id}|%{app-name}|%{window-title}|%{workspace}'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout:
-            output = result.stdout
-            print(f"[PRE-CACHE] Got {len(output)} bytes", flush=True)
-            _parse_aerospace_output(output)
-            print(f"[PRE-CACHE] Loaded {len(_aerospace_windows_cache)} windows", flush=True)
+        windows = get_hammerspoon_windows_sync()
+        if windows:
+            print(f"[PRE-CACHE] Got {len(windows)} windows", flush=True)
+            _parse_hammerspoon_windows(windows)
 
-        # Кэшируем текущий активный workspace
+        # Кэшируем текущий активный space
         update_focused_workspace_sync()
     except Exception as e:
         print(f"[PRE-CACHE] Error: {e}", flush=True)
 
+# Алиас для совместимости
+precache_aerospace_windows = precache_windows
+
 
 def main():
-    # Кэшируем окна AeroSpace ДО создания Qt приложения
-    precache_aerospace_windows()
+    # Кэшируем окна через Hammerspoon ДО создания Qt приложения
+    precache_windows()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
