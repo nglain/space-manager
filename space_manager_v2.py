@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QTimer, QSize, QMetaObject, Q_ARG, pyqtSignal, QObject,
     QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup,
-    QMimeData
+    QMimeData, QProcess
 )
 from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QFont, QAction, QPixmap, QPainter, QColor, QFontDatabase, QDrag
 from AppKit import NSWorkspace, NSImage, NSBitmapImageRep, NSPNGFileType, NSRunningApplication
@@ -108,20 +108,138 @@ def get_space_ids_map():
         return {}
 
 
-def get_window_id_by_title(app_name: str, window_title: str) -> int:
-    """Найти Window ID по имени приложения и заголовку окна"""
+# Кэш AeroSpace окон (обновляется при refresh_apps)
+_aerospace_windows_cache = {}
+_aerospace_cache_time = 0
+
+def get_aerospace_windows_sync():
+    """Синхронное получение окон AeroSpace (вызывать ДО Qt или из pre-cache)"""
     try:
-        windows = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID
+        result = subprocess.run(
+            ['/opt/homebrew/bin/aerospace', 'list-windows', '--all',
+             '--format', '%{window-id}|%{app-name}|%{window-title}|%{workspace}'],
+            capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL
         )
-        for w in windows:
-            owner = w.get('kCGWindowOwnerName', '')
-            title = w.get('kCGWindowName', '')
-            if owner == app_name and title == window_title:
-                return w.get('kCGWindowNumber', 0)
-    except:
-        pass
+        if result.returncode == 0:
+            return result.stdout
+    except Exception as e:
+        print(f"[AEROSPACE] Sync error: {e}", flush=True)
+    return None
+
+
+def refresh_aerospace_cache():
+    """Обновить кэш окон AeroSpace"""
+    global _aerospace_windows_cache, _aerospace_cache_time
+    import time
+    import os
+
+    try:
+        print("[CACHE] Refreshing aerospace windows...", flush=True)
+
+        # Используем pre-cached данные если свежие (< 5 сек)
+        if _aerospace_cache_time and (time.time() - _aerospace_cache_time) < 5:
+            print(f"[CACHE] Using cached data ({len(_aerospace_windows_cache)} windows)", flush=True)
+            return
+
+        # Запускаем синхронно и ждём результат через файл
+        tmp_file = '/tmp/aerospace_windows.txt'
+
+        # Удаляем старый файл
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+
+        # Запускаем команду и ждём
+        os.system(f'/opt/homebrew/bin/aerospace list-windows --all --format "%{{window-id}}|%{{app-name}}|%{{window-title}}|%{{workspace}}" > {tmp_file} 2>/dev/null')
+
+        # Ждём появления файла (до 2 сек)
+        for _ in range(20):
+            if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
+                break
+            time.sleep(0.1)
+
+        if os.path.exists(tmp_file):
+            with open(tmp_file, 'r') as f:
+                output = f.read()
+            if output:
+                _parse_aerospace_output(output)
+                print(f"[CACHE] Refreshed: {len(_aerospace_windows_cache)} windows", flush=True)
+    except Exception as e:
+        print(f"AeroSpace cache refresh error: {e}", flush=True)
+
+
+def _parse_aerospace_output(output):
+    """Парсить вывод aerospace list-windows"""
+    global _aerospace_windows_cache, _aerospace_cache_time
+    import time
+
+    _aerospace_windows_cache = {}
+    for line in output.strip().split('\n'):
+        if not line.strip():
+            continue
+        parts = line.split('|')
+        if len(parts) >= 4:
+            wid = parts[0].strip()
+            app = parts[1].strip()
+            title = parts[2].strip()
+            workspace = parts[3].strip()
+            # Сохраняем и ID, и workspace
+            key = f"{app}|{title}"
+            _aerospace_windows_cache[key] = {
+                'id': int(wid),
+                'workspace': workspace,
+                'app': app,
+                'title': title
+            }
+    _aerospace_cache_time = time.time()
+    print(f"[CACHE] AeroSpace cache updated: {len(_aerospace_windows_cache)} windows", flush=True)
+
+
+def get_windows_by_workspace():
+    """Получить окна сгруппированные по workspace (из aerospace)"""
+    result = {}
+    for key, data in _aerospace_windows_cache.items():
+        ws = data['workspace']
+        if ws not in result:
+            result[ws] = []
+        result[ws].append({
+            'app': data['app'],
+            'title': data['title'],
+            'window_id': data['id']
+        })
+    return result
+
+
+def get_window_id_by_title(app_name: str, window_title: str) -> int:
+    """Найти Window ID по имени приложения и заголовку окна.
+
+    Использует кэш AeroSpace (новый формат с dict).
+    """
+    if not _aerospace_windows_cache:
+        print(f"[GET_ID] Cache empty!", flush=True)
+        return 0
+
+    # Точное совпадение
+    key = f"{app_name}|{window_title}"
+    if key in _aerospace_windows_cache:
+        wid = _aerospace_windows_cache[key]['id']
+        print(f"[GET_ID] Exact match: {app_name} -> {wid}", flush=True)
+        return wid
+
+    # Частичное совпадение (title может быть обрезан)
+    for cached_key, data in _aerospace_windows_cache.items():
+        cached_app = data['app']
+        cached_title = data['title']
+        if cached_app == app_name:
+            # Проверяем совпадение начала title (первые 30 символов)
+            if (cached_title[:30] == window_title[:30] or
+                window_title.startswith(cached_title[:30]) or
+                cached_title.startswith(window_title[:30])):
+                wid = data['id']
+                print(f"[GET_ID] Partial match: {app_name} -> {wid}", flush=True)
+                return wid
+
+    print(f"[GET_ID] Not found: {app_name} | {window_title[:40]}", flush=True)
     return 0
 
 
@@ -136,20 +254,17 @@ def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
     2. yabai (требует частичного отключения SIP)
     3. SkyLight API (часто не работает на современных macOS)
     """
-    import subprocess
+    global _aerospace_cache_time
+    import os
 
-    # Метод 1: AeroSpace (рекомендуется)
+    # Метод 1: AeroSpace - через os.system в background (обход Qt блокировки)
     try:
-        result = subprocess.run(
-            ['aerospace', 'move-node-to-workspace', str(target_space_num), '--window-id', str(window_id)],
-            capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            return True, "Перемещено через AeroSpace"
-        else:
-            print(f"AeroSpace error: {result.stderr}")
-    except FileNotFoundError:
-        pass  # AeroSpace не установлен
+        cmd = f'/opt/homebrew/bin/aerospace move-node-to-workspace {target_space_num} --window-id {window_id} </dev/null >/dev/null 2>&1 &'
+        print(f"[MOVE] Executing: {cmd}", flush=True)
+        os.system(cmd)
+        # Сбрасываем кэш чтобы следующий refresh получил свежие данные
+        _aerospace_cache_time = 0
+        return True, "Перемещено через AeroSpace"
     except Exception as e:
         print(f"AeroSpace error: {e}")
 
@@ -543,75 +658,100 @@ class AppItemWidget(QWidget):
             super().mousePressEvent(event)
 
 
-class WindowItemWidget(QFrame):
-    """Виджет отдельного окна (для развёрнутого отображения) с hover, click и drag"""
+class WindowItemWidget(QPushButton):
+    """Виджет отдельного окна (на основе QPushButton для надёжного приёма событий мыши)"""
 
-    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False, app_name: str = "", space_num: int = 0):
+    def __init__(self, title: str, is_active_space: bool = False, minimized: bool = False, app_name: str = "", space_num: int = 0, window_id: int = 0):
         super().__init__()
         self.app_name = app_name
         self.window_title = title
         self.minimized = minimized
         self.is_active = is_active_space
         self.space_num = space_num  # Текущий Space окна
+        self.window_id = window_id  # AeroSpace window ID для перемещения
         self._drag_start_pos = None
 
-        self.setFixedHeight(22)
+        self.setFixedHeight(24)
         self.setMouseTracking(True)
         if not minimized:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # Базовый стиль
-        self.setStyleSheet("background: transparent; border-radius: 4px;")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(4)
-
-        # Маленькая иконка приложения или статус
-        self.icon_label = QLabel()
-        self.icon_label.setFixedSize(12, 12)
+        # Получаем иконку
+        icon_text = ""
         if minimized:
-            self.icon_label.setText("📥")
-            self.icon_label.setFont(QFont(".AppleSystemUIFont", 9))
+            icon_text = "📥 "
         elif app_name:
             pixmap = get_app_icon(app_name, 12)
             if not pixmap.isNull():
-                self.icon_label.setPixmap(pixmap)
-            else:
-                self.icon_label.setText("•")
-                self.icon_label.setStyleSheet("color: #888;")
-        else:
-            self.icon_label.setText("•")
-            color = '#aaa' if is_active_space else '#666'
-            self.icon_label.setStyleSheet(f"color: {color};")
-        layout.addWidget(self.icon_label)
+                self.setIcon(QIcon(pixmap))
+                self.setIconSize(QSize(12, 12))
 
-        # Название окна
+        # Формируем текст кнопки
         if minimized:
             display_title = title[:30] + "..." if len(title) > 30 else title
-            display_title += " (свёрнуто)"
+            display_title = icon_text + display_title + " (свёрнуто)"
             self.text_color = '#666'
         else:
             display_title = title[:40] + "..." if len(title) > 40 else title
             self.text_color = '#ddd' if is_active_space else '#aaa'
 
-        self.title_label = QLabel(display_title)
-        self.title_label.setFont(QFont(".AppleSystemUIFont", 9))
-        self.title_label.setStyleSheet(f"color: {self.text_color}; background: transparent;")
-        layout.addWidget(self.title_label, 1)
+        self.setText(display_title)
+        self.setFont(QFont(".AppleSystemUIFont", 9))
 
         self._update_style(hovered=False)
 
+        # Подключаем клик
+        self.clicked.connect(self._on_clicked)
+
+    def _on_clicked(self):
+        """Обработка клика - активировать окно"""
+        if not self.minimized:
+            print(f"[CLICK] Button clicked: {self.app_name}", flush=True)
+            activate_window(self.app_name, self.window_title)
+            main_window = self.window()
+            if main_window:
+                QTimer.singleShot(300, main_window.hide)
+
     def _update_style(self, hovered: bool):
         if self.minimized:
-            self.setStyleSheet("WindowItemWidget { background: transparent; }")
+            self.setStyleSheet("""
+                QPushButton {
+                    background: rgba(50,50,52,0.2);
+                    border: none;
+                    border-radius: 4px;
+                    text-align: left;
+                    padding-left: 8px;
+                    color: #666;
+                }
+            """)
         elif hovered:
-            # Яркая голубая подсветка как в macOS
-            self.setStyleSheet("WindowItemWidget { background: rgba(10, 132, 255, 0.5); border-radius: 4px; }")
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(10, 132, 255, 0.5);
+                    border: none;
+                    border-radius: 4px;
+                    text-align: left;
+                    padding-left: 8px;
+                    color: {self.text_color};
+                }}
+            """)
         else:
-            self.setStyleSheet("WindowItemWidget { background: transparent; border-radius: 4px; }")
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(50,50,52,0.3);
+                    border: none;
+                    border-radius: 4px;
+                    text-align: left;
+                    padding-left: 8px;
+                    color: {self.text_color};
+                }}
+                QPushButton:hover {{
+                    background: rgba(10, 132, 255, 0.5);
+                }}
+            """)
 
     def enterEvent(self, event):
+        print(f"[HOVER] Enter: {self.app_name}")
         if not self.minimized:
             self._update_style(hovered=True)
         super().enterEvent(event)
@@ -622,44 +762,109 @@ class WindowItemWidget(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.minimized:
-            # Сохраняем позицию для определения drag
+            # Сохраняем позицию для drag detection
             self._drag_start_pos = event.pos()
-            event.accept()
-            return
+            print(f"[MOUSE] Press at {event.pos().x()},{event.pos().y()} on {self.app_name}", flush=True)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if not self.minimized and self._drag_start_pos is not None:
-            # Проверяем дистанцию для начала drag
-            if (event.pos() - self._drag_start_pos).manhattanLength() > 10:
-                self._start_drag()
+            dist = (event.pos() - self._drag_start_pos).manhattanLength()
+            if dist > 10:
+                print(f"[MOUSE] Drag threshold reached: {dist}px", flush=True)
                 self._drag_start_pos = None
+                self._start_drag()
                 return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and not self.minimized:
-            if self._drag_start_pos is not None:
-                # Это был клик, не drag — активируем окно
-                self._drag_start_pos = None
-                activate_window(self.app_name, self.window_title)
-                main_window = self.window()
-                if main_window:
-                    QTimer.singleShot(300, main_window.hide)
-                event.accept()
-                return
+        # Сбрасываем drag position при отпускании кнопки
+        self._drag_start_pos = None
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        """Контекстное меню для перемещения окна на другой Space"""
+        if self.minimized:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: rgba(40, 40, 42, 0.95);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                color: #fff;
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(10, 132, 255, 0.8);
+            }
+        """)
+
+        # Заголовок
+        title_action = menu.addAction(f"📦 {self.app_name}")
+        title_action.setEnabled(False)
+        menu.addSeparator()
+
+        # Подменю "Переместить на Space"
+        move_menu = menu.addMenu("➜ Переместить на Space")
+        move_menu.setStyleSheet(menu.styleSheet())
+
+        for i in range(1, 17):  # 16 spaces
+            if i != self.space_num:  # Не показываем текущий Space
+                action = move_menu.addAction(f"Space {i}")
+                action.triggered.connect(lambda checked, target=i: self._move_to_space(target))
+
+        menu.exec(event.globalPos())
+
+    def _move_to_space(self, target_space: int):
+        """Переместить окно на указанный Space"""
+        # Используем сохранённый window_id напрямую
+        window_id = self.window_id
+        if not window_id:
+            # Fallback: пробуем найти через кэш
+            window_id = get_window_id_by_title(self.app_name, self.window_title)
+
+        print(f"[MOVE] Moving {self.app_name} (ID={window_id}) from Space {self.space_num} to Space {target_space}", flush=True)
+
+        if window_id:
+            success, message = move_window_to_space(window_id, target_space)
+            print(f"[MOVE] Result: {success}, {message}", flush=True)
+
+            if success:
+                # Мгновенное обновление UI (без полного refresh)
+                main_window = self.window()
+                if main_window and hasattr(main_window, 'space_cards'):
+                    # Скрываем себя (убираем из source карточки)
+                    self.setVisible(False)
+                    self.setEnabled(False)
+
+                    # Добавляем в target карточку
+                    if target_space in main_window.space_cards:
+                        target_card = main_window.space_cards[target_space]
+                        # Показываем успех на target карточке
+                        target_card._show_success_flash()
+                        # Добавляем окно в target
+                        target_card._add_window_to_card(self.app_name, self.window_title, window_id)
+        else:
+            print(f"[MOVE] Window ID not found for {self.app_name}", flush=True)
 
     def _start_drag(self):
         """Начать drag операцию"""
+        print(f"[DRAG] Starting drag: {self.app_name} - {self.window_title[:30]}, space={self.space_num}, wid={self.window_id}")
         drag = QDrag(self)
         mime_data = QMimeData()
 
-        # Сохраняем информацию об окне в MIME
+        # Сохраняем информацию об окне в MIME (включая window_id!)
         data = json.dumps({
             "app_name": self.app_name,
             "window_title": self.window_title,
-            "source_space": self.space_num
+            "source_space": self.space_num,
+            "window_id": self.window_id
         })
         mime_data.setData("application/x-space-window", data.encode())
         mime_data.setText(f"{self.app_name}: {self.window_title}")
@@ -844,19 +1049,22 @@ class SpaceCard(QFrame):
 
     def dragEnterEvent(self, event):
         """Принимаем drag если это окно"""
+        print(f"[DRAG] dragEnterEvent on Space {self.space_num}")
         if event.mimeData().hasFormat("application/x-space-window"):
             # Парсим данные чтобы проверить source
             try:
                 data = json.loads(bytes(event.mimeData().data("application/x-space-window")).decode())
                 source_space = data.get("source_space", 0)
+                print(f"[DRAG] source_space={source_space}, target={self.space_num}")
                 # Не принимаем drop на тот же Space
                 if source_space != self.space_num:
                     event.acceptProposedAction()
                     self._is_drop_target = True
                     self._update_drop_style()
+                    print("[DRAG] Accepted!")
                     return
-            except:
-                pass
+            except Exception as e:
+                print(f"[DRAG] Parse error: {e}")
         event.ignore()
 
     def dragLeaveEvent(self, event):
@@ -867,10 +1075,12 @@ class SpaceCard(QFrame):
 
     def dropEvent(self, event):
         """Обрабатываем drop — перемещаем окно"""
+        print(f"[DROP] dropEvent triggered on Space {self.space_num}")
         self._is_drop_target = False
         self.update_style()
 
         if not event.mimeData().hasFormat("application/x-space-window"):
+            print("[DROP] No valid mime data")
             event.ignore()
             return
 
@@ -879,35 +1089,46 @@ class SpaceCard(QFrame):
             app_name = data.get("app_name", "")
             window_title = data.get("window_title", "")
             source_space = data.get("source_space", 0)
+            window_id = data.get("window_id", 0)  # Берём window_id напрямую из drag data!
+            print(f"[DROP] Data: app={app_name}, title={window_title[:30]}, source={source_space}, wid={window_id}")
 
             if source_space == self.space_num:
+                print("[DROP] Same space, ignoring")
                 event.ignore()
                 return
 
-            # Находим Window ID
-            window_id = get_window_id_by_title(app_name, window_title)
+            # Если window_id не был в drag data - пробуем найти через кэш
+            if not window_id:
+                window_id = get_window_id_by_title(app_name, window_title)
+            print(f"[DROP] Window ID: {window_id}")
             if window_id:
                 print(f"Moving window {window_id} ({app_name}: {window_title}) from Space {source_space} to Space {self.space_num}")
+
+                # Визуальный фидбек - мгновенно показываем успех
+                self._show_success_flash()
 
                 # Перемещаем окно
                 success, message = move_window_to_space(window_id, self.space_num)
 
                 if success:
                     event.acceptProposedAction()
-                    # Обновляем UI
+
+                    # Мгновенно обновляем UI (без полного refresh)
                     main_window = self.window()
-                    if hasattr(main_window, 'refresh_apps'):
-                        QTimer.singleShot(500, main_window.refresh_apps)
+                    if main_window and hasattr(main_window, 'space_cards'):
+                        # Убираем окно из source карточки
+                        if source_space in main_window.space_cards:
+                            source_card = main_window.space_cards[source_space]
+                            self._remove_window_from_card(source_card, app_name, window_title)
+
+                        # Добавляем в target карточку (эту)
+                        self._add_window_to_card(app_name, window_title, window_id)
+
+                    # НЕ делаем полный refresh - доверяем мгновенному обновлению
+                    # Refresh будет при следующем открытии Space Manager
                     return
                 else:
-                    # Показываем сообщение об ошибке
                     print(f"Move failed: {message}")
-                    # Можно добавить QToolTip или StatusBar сообщение
-                    main_window = self.window()
-                    if main_window:
-                        # Временно показываем в заголовке
-                        main_window.setWindowTitle(f"⚠️ {message}")
-                        QTimer.singleShot(3000, lambda: main_window.setWindowTitle("Space Manager"))
 
             event.ignore()
 
@@ -926,6 +1147,37 @@ class SpaceCard(QFrame):
                 }
                 QLabel { color: #ffffff; background: transparent; }
             """)
+
+    def _show_success_flash(self):
+        """Мигнуть зелёным при успешном drop"""
+        self.setStyleSheet("""
+            SpaceCard {
+                background-color: rgba(52, 199, 89, 0.8);
+                border: 2px solid rgba(52, 199, 89, 1);
+                border-radius: 12px;
+            }
+            QLabel { color: #ffffff; background: transparent; }
+        """)
+        QTimer.singleShot(300, self.update_style)
+
+    def _remove_window_from_card(self, card, app_name: str, window_title: str):
+        """Убрать окно из карточки (мгновенно, без rebuild)"""
+        for i in range(card.apps_layout.count()):
+            item = card.apps_layout.itemAt(i)
+            if item and item.widget():
+                widget = item.widget()
+                if hasattr(widget, 'app_name') and hasattr(widget, 'window_title'):
+                    if widget.app_name == app_name and widget.window_title.startswith(window_title[:20]):
+                        # Только скрываем — удаление при полном refresh
+                        widget.setVisible(False)
+                        widget.setEnabled(False)
+                        break
+
+    def _add_window_to_card(self, app_name: str, window_title: str, window_id: int):
+        """Добавить окно в эту карточку (мгновенно)"""
+        win_widget = WindowItemWidget(window_title, self.is_active, False, app_name, self.space_num, window_id)
+        # Вставляем в начало
+        self.apps_layout.insertWidget(0, win_widget)
 
     def set_apps(self, windows: list):
         """Установить список окон - каждое окно отдельной строкой с иконкой"""
@@ -952,9 +1204,11 @@ class SpaceCard(QFrame):
             app_name = w.get("app", "") if isinstance(w, dict) else ""
             title = w.get("title", "") if isinstance(w, dict) else str(w)
             minimized = w.get("minimized", False) if isinstance(w, dict) else False
+            window_id = w.get("window_id", 0) if isinstance(w, dict) else 0
             if title:
-                win_widget = WindowItemWidget(title, self.is_active, minimized, app_name, self.space_num)
+                win_widget = WindowItemWidget(title, self.is_active, minimized, app_name, self.space_num, window_id)
                 self.apps_layout.addWidget(win_widget)
+                print(f"[WIDGET] Created WindowItemWidget: {app_name} - {title[:30]}, space={self.space_num}, wid={window_id}", flush=True)
 
         # Если окон больше 5 - добавить "Смотреть все"
         if len(windows) > max_visible:
@@ -1031,8 +1285,33 @@ class SpaceCard(QFrame):
     def mousePressEvent(self, event):
         if not self.exists:
             return  # Игнорируем клики на несуществующих
+
+        # Проверяем, не кликнули ли на WindowItemWidget
+        global_pos = event.globalPosition().toPoint()
+        app = QApplication.instance()
+        widget_at = app.widgetAt(global_pos)
+
+        print(f"[SPACECARD] mousePressEvent on space {self.space_num}", flush=True)
+        print(f"[SPACECARD] global_pos={global_pos.x()},{global_pos.y()}", flush=True)
+        print(f"[SPACECARD] widget_at={widget_at.__class__.__name__ if widget_at else 'None'}", flush=True)
+
+        if widget_at:
+            # Проверяем всю иерархию от виджета до SpaceCard
+            w = widget_at
+            while w:
+                print(f"[SPACECARD] checking parent: {w.__class__.__name__}", flush=True)
+                if isinstance(w, WindowItemWidget):
+                    print(f"[SPACECARD] Found WindowItemWidget! Ignoring this event.", flush=True)
+                    # Игнорируем событие - дочерний виджет его обработает
+                    event.ignore()
+                    return
+                if w == self:
+                    break
+                w = w.parent()
+
         if event.button() == Qt.MouseButton.LeftButton:
-            # Single click - переключение
+            # Single click - переключение (только если клик не на окне)
+            print(f"[SPACECARD] Click on card body, switching to space {self.space_num}")
             self.parent().parent().parent().switch_to_space(self.space_num)
 
     def mouseDoubleClickEvent(self, event):
@@ -1469,6 +1748,7 @@ class SpaceManager(QMainWindow):
             self.show_and_raise()
 
     def show_and_raise(self):
+        print("[SHOW] show_and_raise called!", flush=True)
         # Fade-in анимация
         self.setWindowOpacity(0)
         self.show()
@@ -1488,25 +1768,22 @@ class SpaceManager(QMainWindow):
         self.refresh_apps()
 
     def refresh_apps(self):
-        """Обновить список окон - свёрнутые хранятся отдельно"""
-        # Получаем только видимые окна для текущего Space
-        visible_windows = get_windows_on_current_space(include_minimized=False)
+        """Обновить список окон используя данные AeroSpace"""
+        # Обновляем кэш AeroSpace окон (если устарел)
+        refresh_aerospace_cache()
 
-        # Получаем все окна чтобы найти свёрнутые
-        all_windows = get_windows_on_current_space(include_minimized=True)
+        # Получаем окна из AeroSpace кэша по workspace
+        windows_by_ws = get_windows_by_workspace()
+        print(f"[REFRESH] AeroSpace workspaces: {list(windows_by_ws.keys())}", flush=True)
 
-        # Свёрнутые = все минус видимые (по title+app)
-        visible_keys = {(w["app"], w["title"]) for w in visible_windows}
-        minimized_windows = [w for w in all_windows if (w["app"], w["title"]) not in visible_keys]
+        # Обновляем все SpaceCard с данными AeroSpace
+        for space_num, card in self.space_cards.items():
+            ws_key = str(space_num)
+            windows = windows_by_ws.get(ws_key, [])
+            card.set_apps(windows)
 
-        # Помечаем свёрнутые
-        for w in minimized_windows:
-            w["minimized"] = True
-
-        # Сохраняем свёрнутые отдельно (глобально, не для Space)
-        self.config["minimized_windows"] = minimized_windows[:10]
-
-        self._update_apps_ui(visible_windows)
+        # Сохраняем в конфиг
+        self.config["space_windows"] = {str(k): v for k, v in windows_by_ws.items()}
 
     def scan_all_spaces(self):
         """Пройтись по всем Spaces и собрать окна"""
@@ -1725,10 +2002,52 @@ class HotkeySignal(QObject):
     toggle = pyqtSignal()
 
 
+class DebugEventFilter(QObject):
+    """Отладочный фильтр для отслеживания кликов"""
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        # Логируем все типы событий мыши
+        if event.type() == QEvent.Type.MouseButtonPress:
+            print(f"[DEBUG-CLICK] {obj.__class__.__name__} at {event.pos().x()},{event.pos().y()}", flush=True)
+        elif event.type() == QEvent.Type.MouseMove:
+            pass  # Слишком много событий
+        elif event.type() == QEvent.Type.Enter:
+            print(f"[DEBUG-ENTER] {obj.__class__.__name__}", flush=True)
+        return False  # Не перехватываем, просто логируем
+
+
+def precache_aerospace_windows():
+    """Предварительное кэширование окон AeroSpace ДО запуска Qt"""
+    global _aerospace_windows_cache, _aerospace_cache_time
+    import time
+
+    print("[PRE-CACHE] Loading aerospace windows before Qt...", flush=True)
+    try:
+        result = subprocess.run(
+            ['/opt/homebrew/bin/aerospace', 'list-windows', '--all',
+             '--format', '%{window-id}|%{app-name}|%{window-title}|%{workspace}'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout:
+            output = result.stdout
+            print(f"[PRE-CACHE] Got {len(output)} bytes", flush=True)
+            _parse_aerospace_output(output)
+            print(f"[PRE-CACHE] Loaded {len(_aerospace_windows_cache)} windows", flush=True)
+    except Exception as e:
+        print(f"[PRE-CACHE] Error: {e}", flush=True)
+
+
 def main():
+    # Кэшируем окна AeroSpace ДО создания Qt приложения
+    precache_aerospace_windows()
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Space Manager")
+
+    # Глобальный фильтр для отладки
+    debug_filter = DebugEventFilter()
+    app.installEventFilter(debug_filter)
 
     window = SpaceManager()
     window.show_and_raise()  # Показать и загрузить приложения
@@ -1761,8 +2080,8 @@ def main():
     listener.daemon = True
     listener.start()
 
-    print("Space Manager запущен!")
-    print("Hotkey: Ctrl+`")
+    print("Space Manager запущен!", flush=True)
+    print("Hotkey: Ctrl+`", flush=True)
 
     sys.exit(app.exec())
 
