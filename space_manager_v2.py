@@ -259,6 +259,18 @@ def get_window_id_by_title(app_name: str, window_title: str) -> int:
     return 0
 
 
+def update_window_workspace_in_cache(window_id: int, new_workspace: int):
+    """Обновить workspace окна в кэше (без вызова aerospace)"""
+    global _aerospace_windows_cache
+    for key, data in _aerospace_windows_cache.items():
+        if data.get('id') == window_id:
+            old_ws = data.get('workspace')
+            data['workspace'] = str(new_workspace)
+            print(f"[CACHE] Updated window {window_id} workspace: {old_ws} -> {new_workspace}", flush=True)
+            return True
+    return False
+
+
 def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
     """
     Переместить окно на указанный Space/Workspace.
@@ -278,8 +290,8 @@ def move_window_to_space(window_id: int, target_space_num: int) -> tuple:
         cmd = f'/opt/homebrew/bin/aerospace move-node-to-workspace {target_space_num} --window-id {window_id} </dev/null >/dev/null 2>&1 &'
         print(f"[MOVE] Executing: {cmd}", flush=True)
         os.system(cmd)
-        # Сбрасываем кэш чтобы следующий refresh получил свежие данные
-        _aerospace_cache_time = 0
+        # Обновляем кэш вручную (без вызова aerospace)
+        update_window_workspace_in_cache(window_id, target_space_num)
         return True, "Перемещено через AeroSpace"
     except Exception as e:
         print(f"AeroSpace error: {e}")
@@ -1780,11 +1792,37 @@ class SpaceManager(QMainWindow):
         self._fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._fade_animation.start()
 
-        # Обновить приложения
-        self.refresh_apps()
+        # Мгновенное обновление из кэша (без блокирующих вызовов)
+        self.refresh_apps_from_cache()
+
+    def refresh_apps_from_cache(self):
+        """Обновить список окон из кэша (мгновенно, без блокировки)"""
+        # НЕ вызываем refresh_aerospace_cache() — используем pre-cached данные
+
+        # Получаем текущий активный workspace из кэша
+        focused_ws = get_focused_workspace()
+        old_active = self.config.get("active_space", 1)
+        if focused_ws != old_active:
+            print(f"[REFRESH-CACHE] Active workspace: {old_active} -> {focused_ws}", flush=True)
+            self.config["active_space"] = focused_ws
+            # Обновляем визуальное состояние карточек
+            if old_active in self.space_cards:
+                self.space_cards[old_active].set_active(False)
+            if focused_ws in self.space_cards:
+                self.space_cards[focused_ws].set_active(True)
+
+        # Получаем окна из кэша по workspace
+        windows_by_ws = get_windows_by_workspace()
+        print(f"[REFRESH-CACHE] Workspaces: {list(windows_by_ws.keys())}, active: {focused_ws}", flush=True)
+
+        # Обновляем все SpaceCard с данными из кэша
+        for space_num, card in self.space_cards.items():
+            ws_key = str(space_num)
+            windows = windows_by_ws.get(ws_key, [])
+            card.set_apps(windows)
 
     def refresh_apps(self):
-        """Обновить список окон используя данные AeroSpace"""
+        """Обновить список окон используя данные AeroSpace (может блокировать)"""
         # Обновляем кэш AeroSpace окон (если устарел)
         refresh_aerospace_cache()
 
@@ -2102,8 +2140,7 @@ def main():
         except:
             pass
         if keyboard.Key.ctrl in current_keys and is_tilde:
-            # Обновляем focused workspace из отдельного потока (до показа окна)
-            update_focused_workspace_sync()
+            # Показываем окно мгновенно (используем pre-cached данные)
             hotkey_signal.toggle.emit()
 
     def on_release(key):
