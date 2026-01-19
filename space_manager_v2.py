@@ -111,6 +111,7 @@ def get_space_ids_map():
 # Кэш AeroSpace окон (обновляется при refresh_apps)
 _aerospace_windows_cache = {}
 _aerospace_cache_time = 0
+_focused_workspace_cache = 1  # Кэш текущего активного workspace
 
 def get_aerospace_windows_sync():
     """Синхронное получение окон AeroSpace (вызывать ДО Qt или из pre-cache)"""
@@ -128,6 +129,32 @@ def get_aerospace_windows_sync():
     return None
 
 
+def get_focused_workspace() -> int:
+    """Получить текущий активный workspace из кэша (обновляется в pre-cache)"""
+    global _focused_workspace_cache
+    return _focused_workspace_cache
+
+
+def update_focused_workspace_sync() -> int:
+    """Синхронное обновление активного workspace (вызывать ДО Qt!)"""
+    global _focused_workspace_cache
+    try:
+        result = subprocess.run(
+            ['/opt/homebrew/bin/aerospace', 'list-workspaces', '--focused'],
+            capture_output=True, text=True, timeout=2,
+            stdin=subprocess.DEVNULL
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ws = result.stdout.strip()
+            if ws.isdigit():
+                _focused_workspace_cache = int(ws)
+                print(f"[PRE-CACHE] Focused workspace: {_focused_workspace_cache}", flush=True)
+                return _focused_workspace_cache
+    except Exception as e:
+        print(f"[AEROSPACE] update_focused_workspace error: {e}", flush=True)
+    return _focused_workspace_cache
+
+
 def refresh_aerospace_cache():
     """Обновить кэш окон AeroSpace"""
     global _aerospace_windows_cache, _aerospace_cache_time
@@ -135,30 +162,19 @@ def refresh_aerospace_cache():
     import os
 
     try:
-        print("[CACHE] Refreshing aerospace windows...", flush=True)
-
-        # Используем pre-cached данные если свежие (< 5 сек)
-        if _aerospace_cache_time and (time.time() - _aerospace_cache_time) < 5:
+        # Используем pre-cached данные если свежие (< 3 сек)
+        if _aerospace_cache_time and (time.time() - _aerospace_cache_time) < 3:
             print(f"[CACHE] Using cached data ({len(_aerospace_windows_cache)} windows)", flush=True)
             return
 
-        # Запускаем синхронно и ждём результат через файл
+        print("[CACHE] Refreshing aerospace windows...", flush=True)
+
+        # Запускаем синхронно через os.system (блокирует, но aerospace быстрый ~0.03 сек)
         tmp_file = '/tmp/aerospace_windows.txt'
-
-        # Удаляем старый файл
-        if os.path.exists(tmp_file):
-            os.remove(tmp_file)
-
-        # Запускаем команду и ждём
         os.system(f'/opt/homebrew/bin/aerospace list-windows --all --format "%{{window-id}}|%{{app-name}}|%{{window-title}}|%{{workspace}}" > {tmp_file} 2>/dev/null')
 
-        # Ждём появления файла (до 2 сек)
-        for _ in range(20):
-            if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
-                break
-            time.sleep(0.1)
-
-        if os.path.exists(tmp_file):
+        # Читаем результат сразу (os.system уже подождал)
+        if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
             with open(tmp_file, 'r') as f:
                 output = f.read()
             if output:
@@ -1772,9 +1788,21 @@ class SpaceManager(QMainWindow):
         # Обновляем кэш AeroSpace окон (если устарел)
         refresh_aerospace_cache()
 
+        # Получаем текущий активный workspace из AeroSpace
+        focused_ws = get_focused_workspace()
+        old_active = self.config.get("active_space", 1)
+        if focused_ws != old_active:
+            print(f"[REFRESH] Active workspace changed: {old_active} -> {focused_ws}", flush=True)
+            self.config["active_space"] = focused_ws
+            # Обновляем визуальное состояние карточек
+            if old_active in self.space_cards:
+                self.space_cards[old_active].set_active(False)
+            if focused_ws in self.space_cards:
+                self.space_cards[focused_ws].set_active(True)
+
         # Получаем окна из AeroSpace кэша по workspace
         windows_by_ws = get_windows_by_workspace()
-        print(f"[REFRESH] AeroSpace workspaces: {list(windows_by_ws.keys())}", flush=True)
+        print(f"[REFRESH] AeroSpace workspaces: {list(windows_by_ws.keys())}, active: {focused_ws}", flush=True)
 
         # Обновляем все SpaceCard с данными AeroSpace
         for space_num, card in self.space_cards.items():
@@ -2023,6 +2051,7 @@ def precache_aerospace_windows():
 
     print("[PRE-CACHE] Loading aerospace windows before Qt...", flush=True)
     try:
+        # Кэшируем список окон
         result = subprocess.run(
             ['/opt/homebrew/bin/aerospace', 'list-windows', '--all',
              '--format', '%{window-id}|%{app-name}|%{window-title}|%{workspace}'],
@@ -2033,6 +2062,9 @@ def precache_aerospace_windows():
             print(f"[PRE-CACHE] Got {len(output)} bytes", flush=True)
             _parse_aerospace_output(output)
             print(f"[PRE-CACHE] Loaded {len(_aerospace_windows_cache)} windows", flush=True)
+
+        # Кэшируем текущий активный workspace
+        update_focused_workspace_sync()
     except Exception as e:
         print(f"[PRE-CACHE] Error: {e}", flush=True)
 
@@ -2070,6 +2102,8 @@ def main():
         except:
             pass
         if keyboard.Key.ctrl in current_keys and is_tilde:
+            # Обновляем focused workspace из отдельного потока (до показа окна)
+            update_focused_workspace_sync()
             hotkey_signal.toggle.emit()
 
     def on_release(key):
