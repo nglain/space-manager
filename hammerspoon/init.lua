@@ -172,7 +172,7 @@ local function setSpaceName(index, name)
 end
 
 -- Получить окна для конкретного Space
-local function getWindowsForSpace(spaceId)
+function getWindowsForSpace(spaceId)  -- ГЛОБАЛЬНАЯ для scanAllSpaces
     local allWindows = hs.window.allWindows()
     local spaceWindows = {}
 
@@ -290,4 +290,291 @@ spaceWatcher:start()
 
 -- Инициализация
 updateSpacesMenubar()
-hs.alert.show("Spaces Menubar loaded! 📍", 1)
+
+--------------------------------------------------------------------------------
+-- ВЫЕЗЖАЮЩАЯ ПАНЕЛЬ СПРАВА (как Dock)
+--------------------------------------------------------------------------------
+
+-- ГЛОБАЛЬНЫЕ переменные (чтобы не собрал garbage collector)
+SidePanel = nil
+SidePanelVisible = false
+PANEL_WIDTH = 200
+EDGE_TRIGGER = 10  -- пикселей от края для активации (увеличено)
+
+-- Кеш количества окон на каждом Space (обновляется при переключении)
+WindowCountCache = {}
+ScanInProgress = false
+
+-- Глобальные для сканирования
+ScanSpaces = {}
+ScanOriginalSpace = nil
+ScanIdx = 1
+ScanTotal = 0
+
+-- Увеличиваем время ожидания Mission Control
+hs.spaces.setDefaultMCwaitTime(0.6)
+
+-- Глобальный таймер для сканирования
+ScanTimer = nil
+
+-- Сканирование с doEvery (надёжнее чем рекурсия)
+function scanAllSpaces()
+    if ScanInProgress then return end
+
+    local spaces = hs.spaces.spacesForScreen()
+    local totalSpaces = #spaces
+    local originalSpace = hs.spaces.focusedSpace()
+
+    -- Фильтруем только user spaces (не fullscreen)
+    local userSpaces = {}
+    local userIndices = {}
+    for i, sid in ipairs(spaces) do
+        local spaceType = hs.spaces.spaceType(sid)
+        if spaceType == "user" then
+            table.insert(userSpaces, sid)
+            table.insert(userIndices, i)
+        else
+            -- Fullscreen = 1 окно
+            WindowCountCache[i] = 1
+        end
+    end
+
+    if #userSpaces == 0 then
+        hs.alert.show("Нет user spaces", 1)
+        return
+    end
+
+    ScanInProgress = true
+    local currentIdx = 1
+
+    hs.alert.show("Сканирую " .. #userSpaces .. " spaces...", 1)
+
+    -- Используем doEvery - он не зависит от рекурсии
+    -- Сначала переходим, в СЛЕДУЮЩЕМ цикле считаем
+    local lastSpaceId = nil
+    local lastRealIdx = nil
+
+    ScanTimer = hs.timer.doEvery(0.6, function()
+        -- Считаем окна от ПРЕДЫДУЩЕГО перехода (Space уже переключился)
+        if lastSpaceId then
+            local windows = getWindowsForSpace(lastSpaceId)
+            WindowCountCache[lastRealIdx] = #windows
+        end
+
+        if currentIdx > #userSpaces then
+            -- Готово
+            ScanTimer:stop()
+            ScanTimer = nil
+            hs.spaces.gotoSpace(originalSpace)
+            ScanInProgress = false
+            hs.timer.doAfter(0.3, function()
+                if SidePanelVisible then updateSidePanel() end
+                hs.alert.show("✓ " .. #userSpaces .. " spaces!", 0.5)
+            end)
+            return
+        end
+
+        local spaceId = userSpaces[currentIdx]
+        local realIdx = userIndices[currentIdx]
+
+        -- Переходим
+        hs.spaces.gotoSpace(spaceId)
+
+        -- Запоминаем для подсчёта в следующем цикле
+        lastSpaceId = spaceId
+        lastRealIdx = realIdx
+        currentIdx = currentIdx + 1
+    end)
+end
+
+-- Создать панель (ГЛОБАЛЬНАЯ)
+function createSidePanel()
+    local screen = hs.screen.mainScreen():frame()
+
+    SidePanel = hs.canvas.new({
+        x = screen.w - PANEL_WIDTH,
+        y = 0,
+        w = PANEL_WIDTH,
+        h = screen.h
+    })
+
+    -- Фон панели
+    SidePanel[1] = {
+        type = "rectangle",
+        fillColor = { red = 0.1, green = 0.1, blue = 0.1, alpha = 0.95 },
+        roundedRectRadii = { xRadius = 10, yRadius = 10 }
+    }
+
+    SidePanel:level(hs.canvas.windowLevels.floating)
+    SidePanel:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+end
+
+-- Обновить содержимое панели (ГЛОБАЛЬНАЯ для scanAllSpaces)
+function updateSidePanel()
+    if not SidePanel then createSidePanel() end
+
+    -- Очистить всё кроме фона
+    while #SidePanel > 1 do
+        SidePanel:removeElement(2)
+    end
+
+    local spaces = hs.spaces.spacesForScreen()
+    local focused = hs.spaces.focusedSpace()
+    local y = 20
+    local itemHeight = 50
+
+    -- Заголовок + кнопка сканирования
+    SidePanel:appendElements({
+        type = "text",
+        text = "Spaces",
+        textColor = { white = 0.6 },
+        textSize = 12,
+        frame = { x = 15, y = y, w = PANEL_WIDTH - 60, h = 20 }
+    })
+    -- Кнопка 🔄 для сканирования всех Spaces
+    SidePanel:appendElements({
+        type = "text",
+        text = "🔄",
+        textSize = 14,
+        frame = { x = PANEL_WIDTH - 40, y = y - 2, w = 25, h = 25 },
+        trackMouseDown = true,
+        id = "scanButton"
+    })
+    y = y + 30
+
+    for idx, sid in ipairs(spaces) do
+        local name = getSpaceName(idx)
+        local isCurrent = (sid == focused)
+        local windows = getWindowsForSpace(sid)
+        local windowCount = #windows
+
+        -- Обновляем кеш для текущего Space (только он показывает реальные окна)
+        if isCurrent then
+            WindowCountCache[idx] = windowCount
+        end
+        -- Используем кеш если есть, иначе показываем что нашли
+        local displayCount = WindowCountCache[idx] or windowCount
+
+        -- Фон для текущего Space
+        if isCurrent then
+            SidePanel:appendElements({
+                type = "rectangle",
+                frame = { x = 10, y = y - 5, w = PANEL_WIDTH - 20, h = itemHeight - 5 },
+                fillColor = { red = 0.2, green = 0.4, blue = 0.8, alpha = 0.5 },
+                roundedRectRadii = { xRadius = 8, yRadius = 8 }
+            })
+        end
+
+        -- Название Space
+        SidePanel:appendElements({
+            type = "text",
+            text = idx .. ". " .. name,
+            textColor = { white = isCurrent and 1 or 0.8 },
+            textSize = 14,
+            textFont = ".AppleSystemUIFont",
+            frame = { x = 15, y = y, w = PANEL_WIDTH - 30, h = 20 }
+        })
+
+        -- Количество окон (из кеша или текущее)
+        local countText = displayCount .. " окон"
+        if not isCurrent and not WindowCountCache[idx] then
+            countText = "?" -- Ещё не посещали этот Space
+        end
+        SidePanel:appendElements({
+            type = "text",
+            text = countText,
+            textColor = { white = 0.5 },
+            textSize = 11,
+            frame = { x = 15, y = y + 18, w = PANEL_WIDTH - 30, h = 16 }
+        })
+
+        y = y + itemHeight
+    end
+
+    -- Добавить обработчик кликов
+    SidePanel:clickActivating(false)
+    SidePanel:canvasMouseEvents(true, true, true, true)  -- ВАЖНО: включаем все mouse events!
+    SidePanel:mouseCallback(function(canvas, event, id, x, y)
+        if event ~= "mouseDown" then return end  -- Реагируем только на нажатие
+
+        -- Клик на кнопку 🔄 сканирования (в области заголовка справа)
+        if y < 50 and x > PANEL_WIDTH - 50 then
+            scanAllSpaces()
+            return
+        end
+
+        local spaces = hs.spaces.spacesForScreen()
+        local clickedIdx = math.floor((y - 50) / 50) + 1
+
+        if clickedIdx >= 1 and clickedIdx <= #spaces then
+            -- Проверяем какая кнопка нажата
+            local buttons = hs.eventtap.checkMouseButtons()
+
+            if buttons.right then
+                -- Правый клик - переименование (сайдбар остаётся видимым)
+                local currentName = getSpaceName(clickedIdx)
+                hs.timer.doAfter(0.1, function()
+                    local button, newName = hs.dialog.textPrompt(
+                        "Переименовать Desktop " .. clickedIdx,
+                        "Введите новое название:",
+                        currentName,
+                        "OK", "Отмена"
+                    )
+                    if button == "OK" and newName and newName ~= "" then
+                        setSpaceName(clickedIdx, newName)
+                        updateSpacesMenubar()
+                        updateSidePanel()  -- Обновить панель с новым именем
+                    end
+                    hideSidePanel()  -- Скрыть после закрытия диалога
+                end)
+            else
+                -- Левый клик - переход на Space
+                hs.spaces.gotoSpace(spaces[clickedIdx])
+                hideSidePanel()
+            end
+        end
+    end)
+end
+
+-- Показать панель (ГЛОБАЛЬНАЯ)
+function showSidePanel()
+    if SidePanelVisible then return end
+    updateSidePanel()
+    SidePanel:show()
+    SidePanelVisible = true
+end
+
+-- Скрыть панель
+function hideSidePanel()
+    if not SidePanelVisible then return end
+    if SidePanel then SidePanel:hide() end
+    SidePanelVisible = false
+end
+
+-- Отслеживать мышь (ГЛОБАЛЬНАЯ переменная!)
+MouseTracker = hs.eventtap.new({hs.eventtap.event.types.mouseMoved}, function(e)
+    local pos = hs.mouse.absolutePosition()
+    local screen = hs.screen.mainScreen():frame()
+
+    -- Мышь у правого края
+    if pos.x >= screen.w - EDGE_TRIGGER then
+        showSidePanel()
+    -- Мышь ушла от панели
+    elseif SidePanelVisible and pos.x < screen.w - PANEL_WIDTH - 20 then
+        hideSidePanel()
+    end
+
+    return false
+end)
+
+MouseTracker:start()
+
+-- Обновлять панель при смене Space (ГЛОБАЛЬНАЯ!)
+SidePanelWatcher = hs.spaces.watcher.new(function()
+    if SidePanelVisible then
+        updateSidePanel()
+    end
+end)
+SidePanelWatcher:start()
+
+hs.alert.show("Spaces: Menubar + Side Panel loaded! 📍", 1)
